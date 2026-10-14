@@ -42,13 +42,13 @@ claude mcp add local-chrome -s user -- node /绝对路径/claude-chrome/packages
 | `status` | 连接状态、本会话的标签（如 Claude 1）、窗口和标签页 |
 | `tabs_list` / `tabs_create` / `tabs_select` / `tabs_close` | 标签页管理；每个会话的标签页开在自己的窗口和分组里，`owner` 字段标明归属 |
 | `navigate` | 打开 URL，或传 `back` / `forward` |
-| `screenshot` | 默认截可视区域（图片像素 = CSS 像素，可直接用于 `click` 坐标）；`fullPage: true` 截整页（最高 16000px）；`ref` 只截某个元素 |
-| `read_page` | 无障碍树，元素带 `ref_N`，`filter: "interactive"` 只列可操作元素 |
-| `find` | 按角色、名称、值模糊查找元素 |
+| `screenshot` | 默认截可视区域（图片像素 = CSS 像素，可直接用于 `click` 坐标）；`fullPage: true` 滚动分段拼接整页（最高 16000px，吸顶元素只出现一次，100vh 区块保持真实高度）；`ref` 只截某个元素。截图不会切换标签页 |
+| `read_page` | 无障碍树，元素带 `ref_N`，iframe 内容（包括跨站 iframe）嵌套显示在对应的 iframe 下；`filter: "interactive"` 只列可操作元素 |
+| `find` | 按角色、名称、值模糊查找元素，包括 iframe 内的元素 |
 | `click` / `hover` | 按 `ref` 或 `coordinate` |
-| `type` / `key` | 输入文本 / 按键（如 `Enter`、`cmd+a Backspace`） |
+| `type` / `key` | 输入文本 / 按键：如 `Enter`、`cmd+a Backspace`、`shift+1`、`!`、`ctrl++`、单独的 `shift`（按美式键盘布局映射） |
 | `scroll` | 滚轮滚动 |
-| `get_page_text` | 页面正文 |
+| `get_page_text` | 页面正文，附带各 iframe 的文本 |
 | `eval_js` | 在页面执行 JS（支持顶层 await，结果 JSON 编码） |
 | `console_logs` | 控制台日志与未捕获异常 |
 | `file_upload` | 上传本地文件：`ref` 可以是 `<input type=file>`，也可以是会弹出文件选择框的按钮（自动拦截选择框）；页面只有一个文件输入框时可以省略 `ref` |
@@ -62,11 +62,14 @@ Claude 默认只操作本会话当前选中的标签页：先用 `tabs_create` �
 - 只允许 `http(s):` 和 `data:` 页面：`chrome://`、扩展页、`file://`（防止通过 `get_page_text` 读取本地文件）、Chrome 网上应用店始终禁止
 - 可在弹窗里添加禁止的域名（包含子域名，也可以直接粘贴 URL）；`tabs_list` 会隐藏这些站点的标题和 URL；标签页被重定向到禁止的站点后，仍然可以导航离开或关闭
 - 被控制的标签页会显示 Chrome 的「正在调试」提示条；用户点了「取消」后，Claude 不会静默地重新附加
+- 被禁止站点的 iframe：不会出现在 `read_page` / `find` / `get_page_text` 中，截图时会被隐藏，点击落在其中的坐标会被拒绝
+- 内部读取（视口尺寸、页面文本、滚动位置）在隔离环境（isolated world）中执行，页面脚本无法伪造
 - 弹窗里可以一键「暂停控制」或「断开所有标签页的调试」
 - 文件上传在 Server 端校验路径：必须是绝对路径、真实存在的普通文件（先解析软链接和大小写，macOS / Windows 按不区分大小写比较），单个文件不超过 200 MB
   - 始终禁止：`~/.ssh`、`~/.aws`、`~/.gnupg`、`~/.kube`、`~/.config/gh`、`~/.claude`、Keychains、Chrome 配置目录、`.env*`、`.netrc`、`.git-credentials`、shell 历史、`id_*` 私钥、`*.pem/.key/.p12`、`~/.claude-chrome`
   - 设置 `CLAUDE_CHROME_UPLOAD_DIRS` 后，只允许上传这些目录下的文件
   - peer 转发来的上传请求，hub 会再按自己的策略校验一次
+  - 校验通过后，hub 打开文件并确认仍是校验过的那个文件，再复制到私有临时目录；浏览器读取的是这份快照，校验之后再替换软链接或目录也无效
 - 会话 id 在握手时绑定到连接上，peer 无法冒充其他会话；协议版本不一致的连接会被拒绝，并给出明确原因
 
 ## 多个 Claude 会话同时工作
@@ -80,6 +83,11 @@ Claude 默认只操作本会话当前选中的标签页：先用 `tabs_create` �
 - 会话不能操作其他会话的标签页（返回 `TAB_IN_USE`）；只有用户要求时，才用 `tabs_select` 加 `takeOver: true` 接管
 - 会话结束后，它的标签页保留给用户，归属关系随之释放，调试连接也会断开
 - 会话进程崩溃时：新的 hub 连上插件后会公布当前存活的会话，15 秒内没有重新出现的会话，其标签页会被释放
+
+## 保活与故障恢复
+
+- 插件用一个 offscreen 文档每 5 秒唤醒 service worker；worker 被 Chrome 回收或崩溃后，通常 3 秒内恢复连接
+- peer 每 20 秒发一次心跳，连续收不到回应就重新选主；hub 会断开 60 秒没有任何消息的插件和 peer
 
 ## 环境变量
 
@@ -100,11 +108,16 @@ CHROME_PATH="/path/to/Google Chrome for Testing" pnpm e2e      # 功能 E2E
 CHROME_PATH="/path/to/Google Chrome for Testing" pnpm system   # 系统测试：安全、策略、隔离、故障恢复、并发
 ```
 
-E2E 测试会用真实浏览器加载插件，通过 MCP 客户端逐个调用所有工具，覆盖文件上传，以及两个会话并发操作的场景。正式版 Chrome 137 起不再支持 `--load-extension`，所以 E2E 需要使用 Chromium 或 Chrome for Testing。
+E2E 和系统测试会在一个临时配置文件中启动浏览器，通过 `--remote-debugging-pipe` 和 CDP 的 `Extensions.loadUnpacked` 加载插件，再用 MCP 客户端逐个调用工具，不会影响你自己的 Chrome。正式版 Chrome、Chrome for Testing 和 Chromium 都可以：
+
+```bash
+CHROME_PATH="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" pnpm system
+```
 
 ## 已知限制
 
-- `read_page` / `find` 只覆盖主 frame，暂不深入 iframe
+- 需要 Chrome 125 或更新版本（跨站 iframe 依赖 `chrome.debugger` 的子会话）
+- 按键按美式键盘布局映射；其他布局的字符请用 `type` 输入
 - 同一时刻只能连接一个 Chrome（一个配置文件）；多个 Claude 会话可以同时操作这一个 Chrome。多个 Chrome 配置文件都装了插件时，后连上的会替换先连上的
 - 插件会话状态存在 `chrome.storage.session` 中，浏览器重启后清空
 - 控制台日志从 Claude 首次附加到该标签页时才开始收集

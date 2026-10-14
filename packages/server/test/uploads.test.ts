@@ -1,8 +1,8 @@
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { uploadPolicyFromEnv, validateUploadPaths } from "../src/uploads.js";
+import { removeSnapshots, snapshotUploads, uploadPolicyFromEnv, validateUploadPaths } from "../src/uploads.js";
 
 const dir = mkdtempSync(join(tmpdir(), "uploads-test-"));
 const file = join(dir, "report.pdf");
@@ -60,5 +60,36 @@ describe("validateUploadPaths", () => {
     const policy = uploadPolicyFromEnv({ CLAUDE_CHROME_UPLOAD_DIRS: join(dir, "sub") });
     expect(() => validateUploadPaths([file], policy)).toThrow(/outside/);
     expect(validateUploadPaths([file], uploadPolicyFromEnv({ CLAUDE_CHROME_UPLOAD_DIRS: dir }))).toHaveLength(1);
+  });
+});
+
+describe("snapshotUploads", () => {
+  afterAll(() => removeSnapshots());
+
+  it("hands out private copies with the original file name", async () => {
+    const [copy] = await snapshotUploads(validateUploadPaths([file], open), open);
+    expect(copy).not.toBe(file);
+    expect(copy.endsWith("/report.pdf")).toBe(true);
+    expect(readFileSync(copy, "utf8")).toBe("pdf");
+  });
+
+  it("refuses a file swapped for a symlink after validation", async () => {
+    const box = join(dir, "box");
+    mkdirSync(box);
+    const target = join(box, "f.txt");
+    writeFileSync(target, "ok");
+    const validated = validateUploadPaths([target], open);
+    unlinkSync(target);
+    symlinkSync(join(dir, ".env"), target); // attacker swaps in a secret
+    await expect(snapshotUploads(validated, open)).rejects.toThrow();
+  });
+
+  it("keeps same-named files from different folders apart", async () => {
+    mkdirSync(join(dir, "a"));
+    mkdirSync(join(dir, "b"));
+    writeFileSync(join(dir, "a", "same.txt"), "A");
+    writeFileSync(join(dir, "b", "same.txt"), "B");
+    const copies = await snapshotUploads(validateUploadPaths([join(dir, "a", "same.txt"), join(dir, "b", "same.txt")], open), open);
+    expect(copies.map((c) => readFileSync(c, "utf8"))).toEqual(["A", "B"]);
   });
 });

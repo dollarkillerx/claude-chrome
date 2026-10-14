@@ -2,6 +2,7 @@
 // lifecycle / failure recovery, concurrency & performance, and functional edge cases.
 //   CHROME_PATH=... node test/system.e2e.mjs [results.json]
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { inflateSync } from "node:zlib";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import WebSocket from "ws";
@@ -50,6 +51,49 @@ function probe({ hello, origin, headers, sendRaw, waitMs = 7000 } = {}) {
     ws.on("error", () => {});
   });
 }
+
+/** Minimal PNG decoder (8-bit RGB/RGBA, non-interlaced) so tests can check pixels. */
+function decodePng(base64) {
+  const buf = Buffer.from(base64, "base64");
+  let pos = 8;
+  let width = 0, height = 0, channels = 4;
+  const idat = [];
+  while (pos < buf.length) {
+    const len = buf.readUInt32BE(pos);
+    const type = buf.toString("ascii", pos + 4, pos + 8);
+    const data = buf.subarray(pos + 8, pos + 8 + len);
+    if (type === "IHDR") {
+      width = data.readUInt32BE(0);
+      height = data.readUInt32BE(4);
+      channels = data[9] === 6 ? 4 : 3;
+    } else if (type === "IDAT") idat.push(data);
+    pos += 12 + len;
+  }
+  const raw = inflateSync(Buffer.concat(idat));
+  const stride = width * channels;
+  const out = Buffer.alloc(height * stride);
+  for (let y = 0; y < height; y++) {
+    const filter = raw[y * (stride + 1)];
+    for (let x = 0; x < stride; x++) {
+      const v = raw[y * (stride + 1) + 1 + x];
+      const a = x >= channels ? out[y * stride + x - channels] : 0;
+      const b = y > 0 ? out[(y - 1) * stride + x] : 0;
+      const c = x >= channels && y > 0 ? out[(y - 1) * stride + x - channels] : 0;
+      let pred = 0;
+      if (filter === 1) pred = a;
+      else if (filter === 2) pred = b;
+      else if (filter === 3) pred = (a + b) >> 1;
+      else if (filter === 4) {
+        const p0 = a + b - c, pa = Math.abs(p0 - a), pb = Math.abs(p0 - b), pc = Math.abs(p0 - c);
+        pred = pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+      }
+      out[y * stride + x] = (v + pred) & 0xff;
+    }
+  }
+  return { width, height, pixel: (x, y) => [...out.subarray(y * stride + x * channels, y * stride + x * channels + 3)] };
+}
+/** Screenshots go through the display's color profile, so classify by dominant channel, not exact values. */
+const dominant = ([r, g, b]) => (r > g + 60 && r > b + 60 ? "red" : g > r + 60 && g > b + 60 ? "green" : b > r + 60 && b > g + 60 ? "blue" : "other");
 
 const PAGE = `<!doctype html><title>Sys Page</title><main>
 <h1>System test</h1>
@@ -304,6 +348,151 @@ try {
   r = await A.call("navigate", { url: pageUrl + "#section" });
   check("same-document (hash) navigation returns promptly", !r.isError && r.ms < 5000, `${r.ms.toFixed(0)} ms ${r.text}`);
 
+
+  // ---------------------------------------------------------------------------
+  section("Frames, keys & rendering");
+  // A cross-site iframe (localhost vs 127.0.0.1 → out-of-process under site isolation) and a srcdoc frame.
+  const childUrl = env.route(
+    "/child",
+    `<!doctype html><title>Child</title><p>Hello from frame</p>
+<button onclick="parent.postMessage('frame-click', '*')">Frame button</button>
+<input aria-label="Frame input" oninput="parent.postMessage('frame-input:' + this.value, '*')">
+<input type="file" aria-label="Frame file" onchange="parent.postMessage('frame-file:' + this.files[0].name, '*')">`,
+  ).replace("127.0.0.1", "localhost");
+  const framesUrl = env.route(
+    "/frames",
+    `<!doctype html><title>Frames</title><h1>Parent</h1>
+<iframe id="x" src="${childUrl}" style="width:500px;height:220px;border:4px solid #888;margin:30px"></iframe>
+<iframe id="s" srcdoc="<button onclick='window.clicked=1'>Srcdoc button</button>"></iframe>
+<script>window.frameEvents = []; addEventListener('message', (e) => frameEvents.push(e.data));</script>`,
+  );
+  await A.call("navigate", { url: framesUrl });
+  await sleep(500);
+  r = await A.call("find", { query: "Frame button" });
+  const frameButton = refOf(r.text, /button/);
+  check("find reaches into a cross-site iframe", Boolean(frameButton) && r.text.includes("in iframe localhost"), r.text);
+  await A.call("click", { ref: frameButton });
+  const frameField = refOf((await A.call("find", { query: "Frame input" })).text, /textbox/);
+  await A.call("type", { ref: frameField, text: "typed-in-frame" });
+  r = await A.call("eval_js", { code: "window.frameEvents" });
+  check("click and type inside a cross-site iframe", r.text.includes("frame-click") && r.text.includes("frame-input:typed-in-frame"), r.text);
+  const frameFile = join(scratch, "frame-upload.txt");
+  writeFileSync(frameFile, "x");
+  r = await A.call("file_upload", { ref: refOf((await A.call("find", { query: "Frame file" })).text, /button|Frame file/), paths: [frameFile] });
+  await sleep(200);
+  const events = await A.call("eval_js", { code: "window.frameEvents" });
+  check("file_upload into a cross-site iframe", !r.isError && events.text.includes("frame-file:frame-upload.txt"), `${r.text} | ${events.text}`);
+  r = await A.call("find", { query: "Srcdoc button" });
+  await A.call("click", { ref: refOf(r.text, /button/) });
+  r = await A.call("eval_js", { code: "document.getElementById('s').contentWindow.clicked" });
+  check("click inside a same-process (srcdoc) iframe", r.text.trim() === "1", r.text);
+  r = await A.call("read_page");
+  check("read_page nests iframe content under the iframe", /iframe "http:\/\/localhost[^\n]*\n\s+[^\n]*/.test(r.text) && r.text.includes("Frame button"), r.text.slice(0, 600));
+  r = await A.call("get_page_text");
+  check("get_page_text includes iframe text", r.text.includes("Hello from frame"), r.text.slice(0, 300));
+  r = await A.call("screenshot", { ref: frameButton, format: "png" });
+  const btnShot = r.content.find((c) => c.type === "image");
+  check("element screenshot of a button inside a cross-site iframe", btnShot && decodePng(btnShot.data).height < 80, r.text);
+
+  await env.extEval(`chrome.storage.local.set({ blockedHosts: ["localhost"] })`);
+  await sleep(1500);
+  await env.waitConnected(A.call);
+  r = await A.call("read_page");
+  check("blocked iframe is shown as blocked in read_page", r.text.includes("iframe (blocked: localhost)") && !r.text.includes("Frame button"), r.text.slice(0, 400));
+  r = await A.call("find", { query: "Frame button" });
+  check("find skips blocked iframes", r.text.startsWith("No elements"), r.text);
+  r = await A.call("get_page_text");
+  check("get_page_text skips blocked iframes", !r.text.includes("Hello from frame"), r.text.slice(0, 300));
+  const center = json(
+    await A.call("eval_js", {
+      code: "(() => { const b = document.getElementById('x').getBoundingClientRect(); return [Math.round(b.left + b.width / 2), Math.round(b.top + b.height / 2)]; })()",
+    }),
+  );
+  r = await A.call("click", { coordinate: center });
+  check("clicking coordinates inside a blocked iframe is refused", r.isError && r.text.includes("BLOCKED_BY_POLICY"), r.text);
+  r = await A.call("screenshot", { format: "png" });
+  const masked = decodePng(r.content.find((c) => c.type === "image").data);
+  const inside = masked.pixel(center[0], center[1]);
+  check("blocked iframe is hidden in screenshots", !r.isError && inside.every((v) => v > 200), JSON.stringify(inside));
+  await env.extEval(`chrome.storage.local.set({ blockedHosts: [] })`);
+  await sleep(1500);
+  await env.waitConnected(A.call);
+
+  const keysUrl = env.route(
+    "/keys",
+    `<!doctype html><title>Keys</title><input id="k" aria-label="Key field">
+<script>window.downs = []; document.getElementById('k').addEventListener('keydown', (e) => downs.push(e.key + '/' + e.code));</script>`,
+  );
+  await A.call("navigate", { url: keysUrl });
+  await A.call("click", { ref: refOf((await A.call("find", { query: "Key field" })).text, /textbox/) });
+  await A.call("key", { keys: "shift+1 @ plus ? / shift+/ shift" });
+  r = await A.call("eval_js", { code: "[document.getElementById('k').value, window.downs]" });
+  const keyState = json(r);
+  check("US-layout symbols: shift+1, @, plus, ?, /", keyState?.[0] === "!@+?/?", r.text);
+  check("symbol keys carry real codes", keyState?.[1]?.includes("!/Digit1") && keyState?.[1]?.includes("?/Slash"), r.text);
+  check("a lone modifier key can be pressed", keyState?.[1]?.includes("Shift/ShiftLeft"), r.text);
+
+  const spoofUrl = env.route(
+    "/spoof",
+    `<!doctype html><title>Spoof</title><main><p>Real article text that is long enough to count as the main content of this page, `.repeat(3) +
+      `</p></main><script>
+  Object.defineProperty(window, 'innerWidth', { get: () => 5 });
+  Object.defineProperty(window, 'devicePixelRatio', { get: () => 40 });
+  Document.prototype.querySelector = () => null;
+  Object.defineProperty(HTMLElement.prototype, 'innerText', { get: () => 'SPOOFED' });
+</script>`,
+  );
+  await A.call("navigate", { url: spoofUrl });
+  r = await A.call("get_page_text");
+  check("page scripts can't spoof get_page_text (isolated world)", r.text.includes("Real article text") && !r.text.includes("SPOOFED"), r.text.slice(0, 200));
+  r = await A.call("screenshot");
+  check("page scripts can't spoof the viewport size", !r.isError && !r.text.includes("Viewport 5x"), r.text);
+
+  const stitchUrl = env.route(
+    "/stitch",
+    `<!doctype html><title>Stitch</title><style>body{margin:0} header{position:sticky;top:0;height:50px;background:rgb(255,0,0)}
+.hero{height:100vh;background:rgb(0,0,255)} .rest{height:2000px;background:rgb(0,160,0)}</style>
+<header></header><div class="hero"></div><div class="rest"></div>`,
+  );
+  await A.call("navigate", { url: stitchUrl });
+  r = await A.call("screenshot", { fullPage: true, format: "png" });
+  const page = decodePng(r.content.find((c) => c.type === "image").data);
+  // The viewport height can change while debugging starts (Chrome's infobar), so measure it after.
+  const vpH = json(await A.call("eval_js", { code: "innerHeight" }));
+  const rows = { red: 0, blue: 0, green: 0, other: 0 };
+  for (let y = 0; y < page.height; y++) rows[dominant(page.pixel(5, y))]++;
+  check("stitched image has no seams or gaps", rows.other <= 2, JSON.stringify(rows));
+  check("sticky header appears once, not on every slice", rows.red >= 45 && rows.red <= 55, JSON.stringify(rows));
+  check(
+    "100vh hero keeps its real height (not stretched to the page height)",
+    Math.abs(rows.blue - vpH) <= 60 && Math.abs(page.height - (50 + rows.blue + 2000)) <= 3,
+    `${JSON.stringify(rows)} height ${page.height} innerHeight ${vpH}`,
+  );
+  r = await A.call("eval_js", { code: "scrollY" });
+  check("full-page capture restores the scroll position", r.text.trim() === "0", r.text);
+
+  // Background capture: screenshot a tab that isn't the active one without switching to it.
+  const firstTab = json(await A.call("status")).currentTabId;
+  await A.call("tabs_create", { url: pageUrl + "?front" });
+  r = await A.call("screenshot", { tabId: firstTab });
+  const tabsAfter = json(await A.call("tabs_list"));
+  check(
+    "screenshot of a background tab doesn't switch tabs",
+    !r.isError && tabsAfter.find((t) => t.tabId === firstTab)?.active === false,
+    r.text,
+  );
+  await A.call("tabs_select", { tabId: firstTab });
+
+  // Upload snapshot: the page reads the copy taken at upload time, not later edits to the original.
+  const snapFile = join(scratch, "snapshot.txt");
+  writeFileSync(snapFile, "original");
+  await A.call("navigate", { url: uploadUrl });
+  await A.call("file_upload", { paths: [snapFile] });
+  writeFileSync(snapFile, "tampered!");
+  r = await A.call("eval_js", { code: "await document.getElementById('f').files[0].text()" });
+  check("uploads hand the page a snapshot of the validated file", r.text.includes("original"), r.text);
+  await A.call("navigate", { url: pageUrl });
+
   // ---------------------------------------------------------------------------
   section("Lifecycle & failure recovery");
   r = await A.call("eval_js", { code: "await new Promise(() => {})" });
@@ -327,7 +516,9 @@ try {
       recovered = !r.isError;
     }
     check("service worker killed → extension reconnects and serves calls", recovered, r.text.slice(0, 200));
-    info("reconnect after service worker kill", `${((Date.now() - started) / 1000).toFixed(1)} s`);
+    const recoverySeconds = (Date.now() - started) / 1000;
+    check("…within 10 s (offscreen keepalive revives the worker)", recoverySeconds < 10, `${recoverySeconds.toFixed(1)} s`);
+    info("reconnect after service worker kill", `${recoverySeconds.toFixed(1)} s`);
     r = await A.call("eval_js", { code: "document.title" });
     check("session's current tab survives a service worker restart", r.text.includes("Sys Page"), r.text);
     r = await A.call("click", { ref: staleRef });

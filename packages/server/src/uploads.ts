@@ -1,6 +1,19 @@
-import { realpathSync, statSync } from "node:fs";
-import { homedir } from "node:os";
-import { isAbsolute, resolve, sep } from "node:path";
+import {
+  constants,
+  createReadStream,
+  createWriteStream,
+  fstatSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  statSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { basename, isAbsolute, join, resolve, sep } from "node:path";
+import { pipeline } from "node:stream/promises";
 import { BridgeError } from "@claude-chrome/protocol";
 import { CONFIG_DIR } from "./token.js";
 
@@ -103,4 +116,69 @@ export function validateUploadPaths(paths: unknown, policy: UploadPolicy): strin
     }
     return real;
   });
+}
+
+const SNAPSHOT_PREFIX = "claude-chrome-upload-";
+/** Chrome reads the file lazily (when the page submits it), so snapshots must outlive the call. */
+const SNAPSHOT_TTL_MS = 2 * 60 * 60 * 1000;
+const snapshotDirs = new Set<string>();
+
+/**
+ * Closes the check-then-use gap: re-resolves each validated path, opens it without following a final
+ * symlink, verifies the open file is the one that passed validation, and copies it into a private
+ * temp dir. The browser then reads the copy, so swapping a symlink or parent directory after
+ * validation can't redirect the upload to a different file.
+ */
+export async function snapshotUploads(validated: string[], policy: UploadPolicy): Promise<string[]> {
+  pruneSnapshots();
+  const dir = mkdtempSync(join(tmpdir(), SNAPSHOT_PREFIX)); // mode 0700
+  snapshotDirs.add(dir);
+  try {
+    return await Promise.all(
+      validated.map(async (path, index) => {
+        const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+        const opened = fstatSync(fd);
+        // Re-validate *after* opening, then require the open file to be that same inode.
+        const [again] = validateUploadPaths([path], policy);
+        const current = statSync(again);
+        if (!opened.isFile() || opened.ino !== current.ino || opened.dev !== current.dev) {
+          throw new BridgeError("BLOCKED_BY_POLICY", `${path} changed while it was being uploaded; try again.`);
+        }
+        // Index prefix keeps same-named files from different folders apart; the page sees the base name.
+        mkdirSync(join(dir, String(index)), { mode: 0o700 });
+        const target = join(dir, String(index), basename(path));
+        await pipeline(createReadStream("", { fd }), createWriteStream(target, { mode: 0o600 }));
+        return target;
+      }),
+    );
+  } catch (error) {
+    rmSync(dir, { recursive: true, force: true });
+    snapshotDirs.delete(dir);
+    throw error instanceof BridgeError ? error : new BridgeError("BAD_REQUEST", (error as Error).message);
+  }
+}
+
+/** Removes snapshot dirs older than the TTL (including ones left behind by crashed processes). */
+function pruneSnapshots(): void {
+  const base = tmpdir();
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(base).filter((name) => name.startsWith(SNAPSHOT_PREFIX));
+  } catch {
+    return;
+  }
+  for (const name of entries) {
+    const dir = join(base, name);
+    try {
+      if (Date.now() - statSync(dir).mtimeMs > SNAPSHOT_TTL_MS) rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // Raced with another process cleaning up; ignore.
+    }
+  }
+}
+
+/** Called on shutdown: this process's snapshots are no longer needed once its session ends. */
+export function removeSnapshots(): void {
+  for (const dir of snapshotDirs) rmSync(dir, { recursive: true, force: true });
+  snapshotDirs.clear();
 }

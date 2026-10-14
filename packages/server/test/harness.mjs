@@ -54,20 +54,24 @@ export async function startEnv() {
   const base = `http://127.0.0.1:${http.address().port}`;
 
   // --- browser -----------------------------------------------------------------
+  // Branded Chrome 137+ ignores --load-extension, so load the extension over a CDP pipe with
+  // Extensions.loadUnpacked (needs --enable-unsafe-extension-debugging). This works for Chromium,
+  // Chrome for Testing and regular Chrome alike. A throwaway profile keeps the user's Chrome untouched.
   const profile = join(home, "profile");
   const chrome = spawn(
     chromePath,
     [
       `--user-data-dir=${profile}`,
-      `--load-extension=${extensionDir}`,
-      `--disable-extensions-except=${extensionDir}`,
+      "--remote-debugging-pipe",
       "--remote-debugging-port=0",
+      "--enable-unsafe-extension-debugging",
       "--no-first-run",
       "--no-default-browser-check",
       "about:blank",
     ],
-    { stdio: "ignore" },
+    { stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"] },
   );
+  const browserVersion = await loadExtensionOverPipe(chrome, extensionDir);
   let cdpPort;
   for (let i = 0; i < 100 && !cdpPort; i++) {
     const file = join(profile, "DevToolsActivePort");
@@ -78,6 +82,7 @@ export async function startEnv() {
   const cdpHttp = `http://127.0.0.1:${cdpPort}`;
 
   const env = {
+    browserVersion,
     token,
     port,
     home,
@@ -175,6 +180,31 @@ export async function startEnv() {
     },
   };
   return env;
+}
+
+/** Talks CDP over the --remote-debugging-pipe file descriptors (NUL-delimited JSON). */
+async function loadExtensionOverPipe(chrome, dir) {
+  const [, , , input, output] = chrome.stdio;
+  let buffer = "";
+  const pending = new Map();
+  output.on("data", (chunk) => {
+    buffer += chunk.toString();
+    for (let i; (i = buffer.indexOf("\0")) >= 0; ) {
+      const message = JSON.parse(buffer.slice(0, i));
+      buffer = buffer.slice(i + 1);
+      pending.get(message.id)?.(message);
+    }
+  });
+  let nextId = 1;
+  const send = (method, params = {}) =>
+    new Promise((resolve, reject) => {
+      const id = nextId++;
+      pending.set(id, (m) => (m.error ? reject(new Error(`${method}: ${m.error.message}`)) : resolve(m.result)));
+      input.write(JSON.stringify({ id, method, params }) + "\0");
+    });
+  const { product } = await send("Browser.getVersion");
+  await send("Extensions.loadUnpacked", { path: dir });
+  return product;
 }
 
 /** Collects named checks into a JSON-serializable result list. */

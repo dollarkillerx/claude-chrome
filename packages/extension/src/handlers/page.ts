@@ -1,5 +1,6 @@
 import { BridgeError } from "@claude-chrome/protocol";
 import { cdp, clearConsole, ensureAttached, readConsole } from "../cdp";
+import { evaluateIsolated, listFrames } from "../frames";
 import { resolveTab } from "../tabs";
 import type { Context, Params } from "../dispatcher";
 
@@ -66,9 +67,20 @@ const PAGE_TEXT_SCRIPT = `(() => {
 
 export async function getPageText({ tabId, maxChars }: Params, ctx: Context) {
   const tab = await resolveTab(ctx.session, tabId);
-  const page = (await evaluate(tab.id, PAGE_TEXT_SCRIPT)) as { title: string; url: string; text: string };
+  const docs = await listFrames(tab.id);
+  // Isolated world: the page's own scripts can't tamper with querySelector / innerText here.
+  const page = (await evaluateIsolated(tab.id, PAGE_TEXT_SCRIPT)) as { title: string; url: string; text: string };
+  const sections = [page.text];
+  for (const doc of docs) {
+    if (!doc.parentFrameId) continue;
+    if (!doc.allowed) continue; // never read blocked frames
+    const frame = (await evaluateIsolated(tab.id, PAGE_TEXT_SCRIPT, { frameId: doc.frameId, session: doc.session }).catch(
+      () => null,
+    )) as { text: string } | null;
+    if (frame?.text.trim()) sections.push(`--- iframe ${doc.url} ---\n${frame.text}`);
+  }
   const limit = typeof maxChars === "number" ? maxChars : 50_000;
-  const text = page.text.replace(/\n{3,}/g, "\n\n").trim();
+  const text = sections.join("\n\n").replace(/\n{3,}/g, "\n\n").trim();
   const truncated = text.length > limit;
   return `Title: ${page.title}\nURL: ${page.url}\n\n${truncated ? text.slice(0, limit) + "\n…[truncated]" : text}`;
 }

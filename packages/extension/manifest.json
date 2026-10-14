@@ -3,13 +3,14 @@
   "name": "Local Chrome for Claude",
   "version": "0.1.0",
   "description": "Let Claude Code (or any MCP client) control this Chrome through a local MCP bridge — no account pairing.",
-  "minimum_chrome_version": "116",
+  "minimum_chrome_version": "125",
   "permissions": [
     "debugger",
     "tabs",
     "tabGroups",
     "storage",
-    "alarms"
+    "alarms",
+    "offscreen"
   ],
   "host_permissions": [
     "http://127.0.0.1/*",

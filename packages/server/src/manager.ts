@@ -68,6 +68,11 @@ export class BridgeManager {
       if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
       bridge = await Peer.connect({ port, token, session: this.sessionId, log });
     }
+    if (this.closed) {
+      // close() ran while we were electing: don't keep the port (or a hub connection) alive.
+      await bridge.close();
+      throw new Error("Bridge manager closed");
+    }
     this.bridge = bridge;
     bridge.onClose(() => {
       if (this.bridge === bridge) this.bridge = null;

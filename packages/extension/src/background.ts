@@ -126,6 +126,20 @@ async function openSocket(): Promise<void> {
   };
 }
 
+/** Keeps a tiny offscreen document alive that pings (and so revives) this worker every few seconds. */
+async function ensureKeepalive(): Promise<void> {
+  try {
+    if (await chrome.offscreen.hasDocument()) return;
+    await chrome.offscreen.createDocument({
+      url: "offscreen.html",
+      reasons: [chrome.offscreen.Reason.WORKERS],
+      justification: "Revive the service worker promptly so the connection to the local MCP bridge stays up.",
+    });
+  } catch {
+    // Another call created it concurrently, or the API is unavailable; the alarm still covers us.
+  }
+}
+
 function disconnect(): void {
   clearTimeout(retryTimer);
   clearInterval(heartbeat);
@@ -139,7 +153,9 @@ chrome.runtime.onInstalled.addListener(() => void connect());
 chrome.runtime.onStartup.addListener(() => void connect());
 chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === RECONNECT_ALARM && status.state !== "replaced") void connect();
+  if (alarm.name !== RECONNECT_ALARM) return;
+  void ensureKeepalive();
+  if (status.state !== "replaced") void connect();
 });
 
 chrome.storage.onChanged.addListener(async (changes, area) => {
@@ -158,6 +174,11 @@ chrome.storage.onChanged.addListener(async (changes, area) => {
 });
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === "keepalive") {
+    // Waking up is the point; make sure we're (re)connecting.
+    if (status.state !== "replaced") void connect();
+    return false;
+  }
   if (message?.type === "getStatus") {
     sendResponse(status);
   } else if (message?.type === "reconnect") {
@@ -172,4 +193,5 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   return false;
 });
 
+void ensureKeepalive();
 void connect();

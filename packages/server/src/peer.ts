@@ -15,6 +15,8 @@ export interface PeerOptions {
   token: string;
   /** This process's Claude session id, bound to the connection by the hub. */
   session: string;
+  /** Ping interval; the hub is considered dead after two missed pongs. */
+  heartbeatMs?: number;
   log: Logger;
 }
 
@@ -34,6 +36,7 @@ export class Peer implements Bridge {
   private nextId = 1;
   private closeListeners: Array<() => void> = [];
   private heartbeat: NodeJS.Timeout;
+  private lastPong = Date.now();
 
   private constructor(
     private socket: WebSocket,
@@ -41,6 +44,7 @@ export class Peer implements Bridge {
   ) {
     socket.on("message", (raw) => {
       const msg = parse(raw.toString());
+      if (msg?.type === "pong") this.lastPong = Date.now();
       if (msg?.type !== "response") return;
       const pending = this.pending.get(msg.id);
       if (!pending) return;
@@ -65,7 +69,16 @@ export class Peer implements Bridge {
       for (const listener of this.closeListeners.splice(0)) listener();
     });
     socket.on("error", (error) => this.opts.log(`hub connection error: ${error.message}`));
-    this.heartbeat = setInterval(() => socket.send(JSON.stringify({ type: "ping" })), HEARTBEAT_MS);
+    const heartbeatMs = opts.heartbeatMs ?? HEARTBEAT_MS;
+    this.heartbeat = setInterval(() => {
+      // A wedged hub keeps the TCP connection open; without this we'd only notice via call timeouts.
+      if (Date.now() - this.lastPong > heartbeatMs * 2.5) {
+        this.opts.log("hub stopped answering heartbeats; reconnecting");
+        socket.terminate();
+        return;
+      }
+      socket.send(JSON.stringify({ type: "ping" }));
+    }, heartbeatMs);
     this.heartbeat.unref();
   }
 

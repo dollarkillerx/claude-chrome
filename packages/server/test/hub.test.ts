@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
-import WebSocket from "ws";
+import WebSocket, { WebSocketServer } from "ws";
+import { createServer } from "node:net";
 import { CLOSE_UNAUTHORIZED, PROTOCOL_VERSION, type Message } from "@claude-chrome/protocol";
 import { Hub } from "../src/hub.js";
 import { Peer } from "../src/peer.js";
@@ -225,7 +226,46 @@ describe("Peer", () => {
   });
 });
 
+describe("heartbeats", () => {
+  it("a peer drops a hub that accepts but never answers pings", async () => {
+    const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+    cleanups.push(() => new Promise<void>((r) => wss.close(() => r())));
+    wss.on("connection", (socket) => socket.once("message", () => socket.send(JSON.stringify({ type: "welcome", protocol: PROTOCOL_VERSION }))));
+    await new Promise((r) => wss.once("listening", r));
+    const port = (wss.address() as { port: number }).port;
+    const peer = await Peer.connect({ port, token: TOKEN, session: "p", heartbeatMs: 50, log });
+    const closed = new Promise<void>((r) => peer.onClose(r));
+    await expect(Promise.race([closed.then(() => "closed"), new Promise((r) => setTimeout(() => r("open"), 1000))])).resolves.toBe("closed");
+  });
+
+  it("the hub drops a peer that stops sending anything", async () => {
+    const hub = await startHub({ staleMs: 200 });
+    const code = await new Promise<number>((resolve) => {
+      const socket = new WebSocket(`ws://127.0.0.1:${hub.port}`);
+      cleanups.push(() => socket.terminate());
+      socket.on("open", () =>
+        socket.send(JSON.stringify({ type: "hello", role: "peer", token: TOKEN, protocol: PROTOCOL_VERSION, session: "silent" })),
+      );
+      socket.on("close", (c) => resolve(c));
+    });
+    expect(code).toBe(1006); // terminated
+  });
+});
+
 describe("BridgeManager", () => {
+  it("does not keep the port when closed during an election", async () => {
+    const port = 20000 + Math.floor(Math.random() * 20000);
+    const manager = new BridgeManager({ port, token: TOKEN, log });
+    const electing = manager.get().catch(() => null);
+    await manager.close();
+    await electing;
+    const free = await new Promise<boolean>((resolve) => {
+      const server = createServer().once("error", () => resolve(false));
+      server.listen(port, "127.0.0.1", () => server.close(() => resolve(true)));
+    });
+    expect(free).toBe(true);
+  });
+
   it("elects a hub, then a peer, and promotes the peer when the hub goes away", async () => {
     const port = 20000 + Math.floor(Math.random() * 20000);
     const first = new BridgeManager({ port, token: TOKEN, log });

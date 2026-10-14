@@ -21,8 +21,13 @@ function saveCanceled(): Promise<void> {
   return chrome.storage.session.set({ canceledByUser: [...canceledByUser] });
 }
 const consoleBuffers = new Map<number, ConsoleEntry[]>();
+/**
+ * Out-of-process iframes (cross-site frames under site isolation) live in their own renderer and are
+ * only reachable through child CDP sessions: tabId → (frame id → session id).
+ */
+const childSessions = new Map<number, Map<string, string>>();
 const detachListeners: Array<(tabId: number) => void> = [];
-const eventWaiters = new Set<{ tabId: number; method: string; resolve(params: any): void }>();
+const eventWaiters = new Set<{ tabId: number; method: string; resolve(params: any, session?: string): void }>();
 
 export function onDetached(listener: (tabId: number) => void): void {
   detachListeners.push(listener);
@@ -30,6 +35,21 @@ export function onDetached(listener: (tabId: number) => void): void {
 
 export function attachedTabs(): number[] {
   return [...attached];
+}
+
+/** Frame id → CDP session id for the tab's out-of-process iframes. */
+export function frameSessions(tabId: number): Map<string, string> {
+  return childSessions.get(tabId) ?? new Map();
+}
+
+/** Enables the domains we rely on in a (root or child) session and auto-attaches nested OOPIFs. */
+async function prepareSession(tabId: number, session?: string): Promise<void> {
+  await Promise.all([
+    send(tabId, "Runtime.enable", undefined, session),
+    send(tabId, "Page.enable", undefined, session),
+    session ? Promise.resolve() : send(tabId, "Log.enable"),
+  ]);
+  await send(tabId, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }, session);
 }
 
 /** Allow re-attaching after the user canceled the banner (Claude selected the tab explicitly). */
@@ -62,21 +82,33 @@ export async function ensureAttached(tabId: number): Promise<void> {
   }
   attached.add(tabId);
   consoleBuffers.set(tabId, consoleBuffers.get(tabId) ?? []);
-  await Promise.all([send(tabId, "Runtime.enable"), send(tabId, "Log.enable"), send(tabId, "Page.enable")]);
+  childSessions.set(tabId, childSessions.get(tabId) ?? new Map());
+  await prepareSession(tabId);
 }
 
-export async function send<T = any>(tabId: number, method: string, params?: Record<string, unknown>): Promise<T> {
+/** Sends a CDP command to the tab's root session, or to an OOPIF child session when `session` is set. */
+export async function send<T = any>(
+  tabId: number,
+  method: string,
+  params?: Record<string, unknown>,
+  session?: string,
+): Promise<T> {
   try {
-    return (await chrome.debugger.sendCommand({ tabId }, method, params)) as T;
+    return (await chrome.debugger.sendCommand(session ? { tabId, sessionId: session } : { tabId }, method, params)) as T;
   } catch (error) {
     throw mapChromeError(error);
   }
 }
 
 /** Attach (if needed) and send. */
-export async function cdp<T = any>(tabId: number, method: string, params?: Record<string, unknown>): Promise<T> {
+export async function cdp<T = any>(
+  tabId: number,
+  method: string,
+  params?: Record<string, unknown>,
+  session?: string,
+): Promise<T> {
   await ensureAttached(tabId);
-  return send<T>(tabId, method, params);
+  return send<T>(tabId, method, params, session);
 }
 
 export async function detachAll(): Promise<void> {
@@ -88,15 +120,19 @@ export async function detachAll(): Promise<void> {
  * Waits for a CDP event on a tab. Create the waiter *before* triggering the action that emits it.
  * Rejects with TIMEOUT if it doesn't arrive.
  */
-export function waitForEvent<T = any>(tabId: number, method: string, timeoutMs: number): Promise<T> {
+export function waitForEvent<T = any>(
+  tabId: number,
+  method: string,
+  timeoutMs: number,
+): Promise<{ params: T; session?: string }> {
   return new Promise((resolve, reject) => {
     const waiter = {
       tabId,
       method,
-      resolve: (params: T) => {
+      resolve: (params: T, session?: string) => {
         clearTimeout(timer);
         eventWaiters.delete(waiter);
-        resolve(params);
+        resolve({ params, session });
       },
     };
     const timer = setTimeout(() => {
@@ -117,6 +153,7 @@ export function clearConsole(tabId: number): void {
 
 function cleanup(tabId: number): void {
   attached.delete(tabId);
+  childSessions.delete(tabId);
   for (const listener of detachListeners) listener(tabId);
 }
 
@@ -146,7 +183,20 @@ chrome.debugger.onEvent.addListener((source, method, params: any) => {
   const tabId = source.tabId;
   if (tabId === undefined) return;
   for (const waiter of eventWaiters) {
-    if (waiter.tabId === tabId && waiter.method === method) waiter.resolve(params);
+    if (waiter.tabId === tabId && waiter.method === method) waiter.resolve(params, source.sessionId);
+  }
+  if (method === "Target.attachedToTarget" && params.targetInfo?.type === "iframe") {
+    // For iframe targets the target id is the frame id.
+    const sessions = childSessions.get(tabId) ?? new Map<string, string>();
+    sessions.set(params.targetInfo.targetId, params.sessionId);
+    childSessions.set(tabId, sessions);
+    void prepareSession(tabId, params.sessionId).catch(() => {});
+    return;
+  }
+  if (method === "Target.detachedFromTarget") {
+    const sessions = childSessions.get(tabId);
+    for (const [frameId, session] of sessions ?? []) if (session === params.sessionId) sessions!.delete(frameId);
+    return;
   }
   if (method === "Runtime.consoleAPICalled") {
     const frame = params.stackTrace?.callFrames?.[0];

@@ -14,7 +14,7 @@ import {
 } from "@claude-chrome/protocol";
 import { EXTENSION_WAIT_MS, timeoutFor, type Bridge, type Logger } from "./bridge.js";
 import { tokensEqual } from "./token.js";
-import { validateUploadPaths, type UploadPolicy } from "./uploads.js";
+import { removeSnapshots, snapshotUploads, validateUploadPaths, type UploadPolicy } from "./uploads.js";
 
 export interface HubOptions {
   port: number;
@@ -28,6 +28,8 @@ export interface HubOptions {
   session: string;
   /** Re-applied to file_upload calls relayed from peers, so a peer can't skip the policy. */
   uploadPolicy?: UploadPolicy;
+  /** Drop the extension / peers after this long without any message (they ping every 20s). */
+  staleMs?: number;
   log: Logger;
 }
 
@@ -53,6 +55,7 @@ export class Hub implements Bridge {
   private extensionLastSeen = 0;
   /** Peer socket → the session it speaks for (bound at hello, so peers can't impersonate others). */
   private peers = new Map<WebSocket, string>();
+  private peerLastSeen = new Map<WebSocket, number>();
   private pending = new Map<number, Pending>();
   private nextId = 1;
   private extensionWaiters: Array<() => void> = [];
@@ -65,7 +68,7 @@ export class Hub implements Bridge {
     private opts: HubOptions,
   ) {
     wss.on("connection", (socket, req) => this.onConnection(socket, req));
-    this.staleTimer = setInterval(() => this.dropStaleExtension(), STALE_EXTENSION_MS / 2);
+    this.staleTimer = setInterval(() => this.dropStale(), (opts.staleMs ?? STALE_EXTENSION_MS) / 2);
     this.staleTimer.unref();
   }
 
@@ -99,6 +102,12 @@ export class Hub implements Bridge {
     if (method === "status" && !this.extension) {
       return { sessionsOnHub: this.peers.size + 1, extensionConnected: false };
     }
+    if (method === "file_upload") {
+      // The hub is the last hop before the browser: validate with its policy (peers included) and
+      // hand the browser private snapshots so the files can't be swapped after the check.
+      const policy = this.opts.uploadPolicy ?? { allowedDirs: [] };
+      params = { ...params, paths: await snapshotUploads(validateUploadPaths(params.paths, policy), policy) };
+    }
     const result = await this.forward(method, params, session);
     if (method === "status") {
       return { sessionsOnHub: this.peers.size + 1, extensionConnected: true, ...(result as object) };
@@ -121,6 +130,7 @@ export class Hub implements Bridge {
     }
     await new Promise<void>((resolve) => this.wss.close(() => resolve()));
     await new Promise<void>((resolve) => this.http.close(() => resolve()));
+    removeSnapshots();
     for (const listener of this.closeListeners.splice(0)) listener();
   }
 
@@ -243,13 +253,16 @@ export class Hub implements Bridge {
 
   private attachPeer(socket: WebSocket, session: string): void {
     this.peers.set(socket, session);
+    this.peerLastSeen.set(socket, Date.now());
     this.sendToExtension({ type: "session_start", session });
     socket.on("close", () => {
       this.peers.delete(socket);
+      this.peerLastSeen.delete(socket);
       // Let the extension release the departed session's tabs and window.
       this.sendToExtension({ type: "session_end", session });
     });
     socket.on("message", async (raw) => {
+      this.peerLastSeen.set(socket, Date.now());
       const msg = parse(raw.toString());
       if (!msg) return;
       if (msg.type === "ping") {
@@ -260,12 +273,8 @@ export class Hub implements Bridge {
       const response: ResponseMessage = { type: "response", id: msg.id };
       try {
         if (!isMethod(msg.method)) throw new BridgeError("BAD_REQUEST", `Unknown method ${String(msg.method)}`);
-        const params = msg.params ?? {};
-        if (msg.method === "file_upload" && this.opts.uploadPolicy) {
-          params.paths = validateUploadPaths(params.paths, this.opts.uploadPolicy);
-        }
         // Always the session bound at hello; whatever the request claims is ignored.
-        response.result = await this.call(msg.method, params, session);
+        response.result = await this.call(msg.method, msg.params ?? {}, session);
       } catch (error) {
         response.error = toRpcError(error);
       }
@@ -295,10 +304,18 @@ export class Hub implements Bridge {
     }
   }
 
-  private dropStaleExtension(): void {
-    if (this.extension && Date.now() - this.extensionLastSeen > STALE_EXTENSION_MS) {
+  private dropStale(): void {
+    const staleMs = this.opts.staleMs ?? STALE_EXTENSION_MS;
+    if (this.extension && Date.now() - this.extensionLastSeen > staleMs) {
       this.opts.log(`extension (${this.extensionClient}) stopped sending heartbeats; dropping it`);
       this.extension.terminate();
+    }
+    // A hung peer process would otherwise hold its session (and tabs) forever.
+    for (const [socket, seen] of this.peerLastSeen) {
+      if (Date.now() - seen > staleMs) {
+        this.opts.log(`peer session ${this.peers.get(socket)} stopped sending heartbeats; dropping it`);
+        socket.terminate();
+      }
     }
   }
 }

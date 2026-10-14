@@ -2,7 +2,7 @@ import { BridgeError } from "@claude-chrome/protocol";
 import { cdp, waitForEvent } from "../cdp";
 import type { Context, Params } from "../dispatcher";
 import { resolveTab } from "../tabs";
-import { backendIdForRef } from "./accessibility";
+import { resolveRef } from "./accessibility";
 import { click } from "./input";
 
 interface DescribedNode {
@@ -15,8 +15,8 @@ type NodeTarget = { backendNodeId: number } | { nodeId: number };
 
 const FILE_CHOOSER_TIMEOUT_MS = 5_000;
 
-async function describe(tabId: number, target: NodeTarget): Promise<DescribedNode> {
-  const { node } = await cdp<{ node: DescribedNode }>(tabId, "DOM.describeNode", target);
+async function describe(tabId: number, target: NodeTarget, session?: string): Promise<DescribedNode> {
+  const { node } = await cdp<{ node: DescribedNode }>(tabId, "DOM.describeNode", target, session);
   return node;
 }
 
@@ -31,11 +31,17 @@ function isFileInput(node: DescribedNode): boolean {
 }
 
 /** DOM.setFileInputFiles fires input/change events like a real selection. */
-async function setFiles(tabId: number, target: NodeTarget, node: DescribedNode, paths: string[]): Promise<void> {
+async function setFiles(
+  tabId: number,
+  target: NodeTarget,
+  node: DescribedNode,
+  paths: string[],
+  session?: string,
+): Promise<void> {
   if (paths.length > 1 && attr(node, "multiple") === undefined) {
     throw new BridgeError("BAD_REQUEST", "This file input accepts a single file; pass one path.");
   }
-  await cdp(tabId, "DOM.setFileInputFiles", { files: paths, ...target });
+  await cdp(tabId, "DOM.setFileInputFiles", { files: paths, ...target }, session);
 }
 
 export async function fileUpload(params: Params, ctx: Context) {
@@ -47,15 +53,16 @@ export async function fileUpload(params: Params, ctx: Context) {
   const names = paths.map((p: string) => p.split("/").pop()).join(", ");
 
   if (typeof params.ref === "string") {
-    const backendNodeId = backendIdForRef(tab.id, params.ref);
-    const node = await describe(tab.id, { backendNodeId });
+    const { backendNodeId, session } = resolveRef(tab.id, params.ref);
+    const node = await describe(tab.id, { backendNodeId }, session);
     if (isFileInput(node)) {
-      await setFiles(tab.id, { backendNodeId }, node, paths);
+      await setFiles(tab.id, { backendNodeId }, node, paths, session);
       return `Set ${paths.length} file(s) on ${params.ref}: ${names}`;
     }
 
     // Not an input: treat it as a button that opens a file chooser, and intercept the chooser.
-    await cdp(tab.id, "Page.setInterceptFileChooserDialog", { enabled: true });
+    // The chooser opens in the frame that owns the input, which may be an out-of-process iframe.
+    await cdp(tab.id, "Page.setInterceptFileChooserDialog", { enabled: true }, session);
     try {
       const opened = waitForEvent<{ mode: string; backendNodeId?: number }>(
         tab.id,
@@ -64,16 +71,16 @@ export async function fileUpload(params: Params, ctx: Context) {
       );
       opened.catch(() => {}); // avoid an unhandled rejection if click throws first
       await click({ ref: params.ref, tabId: tab.id }, ctx);
-      const chooser = await opened.catch(() => {
+      const { params: chooser, session: chooserSession } = await opened.catch(() => {
         throw new BridgeError("BAD_REQUEST", `Clicking ${params.ref} did not open a file chooser.`);
       });
       if (chooser.mode === "selectSingle" && paths.length > 1) {
         throw new BridgeError("BAD_REQUEST", "This file chooser accepts a single file; pass one path.");
       }
       if (chooser.backendNodeId === undefined) throw new BridgeError("INTERNAL", "File chooser has no input element.");
-      await cdp(tab.id, "DOM.setFileInputFiles", { files: paths, backendNodeId: chooser.backendNodeId });
+      await cdp(tab.id, "DOM.setFileInputFiles", { files: paths, backendNodeId: chooser.backendNodeId }, chooserSession);
     } finally {
-      await cdp(tab.id, "Page.setInterceptFileChooserDialog", { enabled: false }).catch(() => {});
+      await cdp(tab.id, "Page.setInterceptFileChooserDialog", { enabled: false }, session).catch(() => {});
     }
     return `Selected ${paths.length} file(s) via the chooser opened by ${params.ref}: ${names}`;
   }

@@ -3,7 +3,7 @@ import { getSettings } from "./settings";
 
 // file: is deliberately excluded: reading local files via get_page_text would bypass the
 // server's upload denylist (e.g. file:///Users/me/.ssh/id_rsa).
-const ALLOWED_PROTOCOLS = new Set(["http:", "https:", "data:"]);
+const ALLOWED_PROTOCOLS = new Set(["http:", "https:", "data:", "blob:"]);
 
 /** Hosts that are always off-limits (Chrome also refuses to debug the Web Store). */
 const ALWAYS_BLOCKED_HOSTS = ["chromewebstore.google.com", "chrome.google.com"];
@@ -21,7 +21,8 @@ function hostMatches(host: string, pattern: string): boolean {
 
 /** Throws BLOCKED_BY_POLICY if Claude must not operate on `url`. */
 export async function checkUrl(url: string | undefined): Promise<void> {
-  if (!url || url === "about:blank") return;
+  // about:srcdoc only occurs for iframes, whose embedding page was already checked.
+  if (!url || url === "about:blank" || url === "about:srcdoc") return;
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -31,7 +32,15 @@ export async function checkUrl(url: string | undefined): Promise<void> {
   if (!ALLOWED_PROTOCOLS.has(parsed.protocol)) {
     throw new BridgeError("BLOCKED_BY_POLICY", `${parsed.protocol}// pages cannot be controlled`);
   }
-  const host = parsed.hostname.toLowerCase();
+  // blob:https://site/uuid inherits the creating site's host.
+  let host = parsed.hostname.toLowerCase();
+  if (parsed.protocol === "blob:") {
+    try {
+      host = new URL(url.slice("blob:".length)).hostname.toLowerCase();
+    } catch {
+      host = "";
+    }
+  }
   const { blockedHosts } = await getSettings();
   const hit = [...ALWAYS_BLOCKED_HOSTS, ...blockedHosts].find((p) => hostMatches(host, p));
   if (hit) {

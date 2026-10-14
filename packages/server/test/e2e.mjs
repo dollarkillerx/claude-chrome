@@ -1,26 +1,11 @@
-// End-to-end test: real Chromium + built extension + built MCP server, driven through an MCP client.
-// Requires a Chromium that still honors --load-extension (Chromium / Chrome for Testing, not branded Chrome 137+).
+// End-to-end test: real Chrome + built extension + built MCP server, driven through MCP clients.
+// Works with Chromium, Chrome for Testing and regular Chrome (the extension is loaded over a CDP pipe).
 //   CHROME_PATH=/path/to/chrome node test/e2e.mjs
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync } from "node:fs";
-import { createServer } from "node:http";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import WebSocket from "ws";
+import { join } from "node:path";
+import { sleep, startEnv } from "./harness.mjs";
 
-const root = resolve(import.meta.dirname, "../../..");
-const extensionDir = join(root, "packages/extension/dist");
-const serverEntry = join(root, "packages/server/dist/index.js");
-const chromePath = process.env.CHROME_PATH;
-if (!chromePath) throw new Error("Set CHROME_PATH to a Chromium / Chrome for Testing binary");
-
-const token = randomBytes(12).toString("hex");
-const port = 30000 + Math.floor(Math.random() * 20000);
-const home = mkdtempSync(join(tmpdir(), "claude-chrome-e2e-"));
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failures = 0;
 
 function check(name, ok, detail = "") {
@@ -53,85 +38,12 @@ const SINGLE_PAGE = `<!doctype html><title>Single Upload</title>
 <script>document.getElementById("only").addEventListener("change", (e) => {
   document.getElementById("out").textContent = "only:" + e.target.files[0].name;
 });</script>`;
-const ROUTES = { "/": PAGE, "/upload": UPLOAD_PAGE, "/single": SINGLE_PAGE };
-const http = createServer((req, res) =>
-  res.writeHead(200, { "content-type": "text/html" }).end(ROUTES[req.url] ?? PAGE),
-);
-await new Promise((r) => http.listen(0, "127.0.0.1", r));
-const pageUrl = `http://127.0.0.1:${http.address().port}/`;
-
-// --- launch Chromium with the extension ----------------------------------------
-const profile = join(home, "profile");
-const chrome = spawn(
-  chromePath,
-  [
-    `--user-data-dir=${profile}`,
-    `--load-extension=${extensionDir}`,
-    `--disable-extensions-except=${extensionDir}`,
-    "--remote-debugging-port=0",
-    "--no-first-run",
-    "--no-default-browser-check",
-    "about:blank",
-  ],
-  { stdio: "ignore" },
-);
-
-async function devtoolsPort() {
-  const file = join(profile, "DevToolsActivePort");
-  for (let i = 0; i < 100; i++) {
-    if (existsSync(file)) return Number(readFileSync(file, "utf8").split("\n")[0]);
-    await sleep(100);
-  }
-  throw new Error("Chromium did not start");
-}
-
-/** Evaluates an expression in a CDP target and returns the value. */
-async function evaluateIn(target, expression) {
-  const ws = new WebSocket(target.webSocketDebuggerUrl);
-  await new Promise((r) => ws.once("open", r));
-  ws.send(JSON.stringify({ id: 1, method: "Runtime.evaluate", params: { expression, awaitPromise: true, returnByValue: true } }));
-  const msg = await new Promise((r) =>
-    ws.on("message", (raw) => {
-      const m = JSON.parse(raw.toString());
-      if (m.id === 1) r(m); // skip CDP events
-    }),
-  );
-  ws.close();
-  return msg.result?.result?.value;
-}
-
-async function configureExtension(cdpPort) {
-  // Chromium ships component extensions with service workers too; find ours by manifest name.
-  for (let i = 0; i < 100; i++) {
-    const targets = await fetch(`http://127.0.0.1:${cdpPort}/json/list`).then((r) => r.json());
-    for (const target of targets.filter((t) => t.type === "service_worker" && t.url.startsWith("chrome-extension://"))) {
-      if ((await evaluateIn(target, "chrome.runtime.getManifest().name")) !== "Local Chrome for Claude") continue;
-      await evaluateIn(target, `chrome.storage.local.set(${JSON.stringify({ token, port })})`);
-      return;
-    }
-    await sleep(100);
-  }
-  throw new Error("Extension service worker not found");
-}
-
-// --- MCP clients (each one = one Claude session = one server process) ------------
-async function connectClient(name) {
-  const client = new Client({ name, version: "0" });
-  await client.connect(
-    new StdioClientTransport({
-      command: process.execPath,
-      args: [serverEntry],
-      env: { ...process.env, CLAUDE_CHROME_TOKEN: token, CLAUDE_CHROME_PORT: String(port), CLAUDE_CHROME_HOME: home },
-      stderr: "inherit",
-    }),
-  );
-  const call = async (tool, args = {}) => {
-    const res = await client.callTool({ name: tool, arguments: args });
-    const text = res.content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
-    return { ...res, text };
-  };
-  return { client, call };
-}
+const env = await startEnv();
+console.log(`browser: ${env.browserVersion}`);
+const pageUrl = env.route("/", PAGE);
+env.route("/upload", UPLOAD_PAGE);
+env.route("/single", SINGLE_PAGE);
+const connectClient = (name) => env.connectClient(name);
 
 const { client, call } = await connectClient("e2e-a");
 let clientB;
@@ -150,7 +62,7 @@ try {
   const tools = await client.listTools();
   check("lists 18 tools", tools.tools.length === 18, tools.tools.length);
 
-  await configureExtension(await devtoolsPort());
+  await env.pair();
   let status;
   for (let i = 0; i < 50; i++) {
     status = JSON.parse((await call("status")).text);
@@ -322,14 +234,7 @@ try {
   r = await call("tabs_close");
   check("tabs_close", !r.isError, r.text);
 } finally {
-  await clientB?.client.close().catch(() => {});
-  await client.close().catch(() => {});
-  const exited = new Promise((r) => chrome.once("exit", r));
-  chrome.kill();
-  http.close();
-  await Promise.race([exited, sleep(5000)]);
-  // Chromium may still flush profile files right after exit.
-  rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  await env.close();
   rmSync(files, { recursive: true, force: true });
 }
 
