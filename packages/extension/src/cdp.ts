@@ -9,8 +9,17 @@ export interface ConsoleEntry {
 
 const CONSOLE_LIMIT = 200;
 const attached = new Set<number>();
-/** Tabs where the user clicked "Cancel" on Chrome's debugging banner; don't silently re-attach. */
+/**
+ * Tabs where the user clicked "Cancel" on Chrome's debugging banner; don't silently re-attach.
+ * Persisted so a service-worker restart doesn't forget the user's decision.
+ */
 const canceledByUser = new Set<number>();
+const canceledLoaded = chrome.storage.session.get("canceledByUser").then(({ canceledByUser: ids }) => {
+  for (const id of (ids as number[] | undefined) ?? []) canceledByUser.add(id);
+});
+function saveCanceled(): Promise<void> {
+  return chrome.storage.session.set({ canceledByUser: [...canceledByUser] });
+}
 const consoleBuffers = new Map<number, ConsoleEntry[]>();
 const detachListeners: Array<(tabId: number) => void> = [];
 const eventWaiters = new Set<{ tabId: number; method: string; resolve(params: any): void }>();
@@ -24,12 +33,20 @@ export function attachedTabs(): number[] {
 }
 
 /** Allow re-attaching after the user canceled the banner (Claude selected the tab explicitly). */
-export function allowReattach(tabId: number): void {
-  canceledByUser.delete(tabId);
+export async function allowReattach(tabId: number): Promise<void> {
+  await canceledLoaded;
+  if (canceledByUser.delete(tabId)) await saveCanceled();
+}
+
+export async function detachTab(tabId: number): Promise<void> {
+  if (!attached.has(tabId)) return;
+  await chrome.debugger.detach({ tabId }).catch(() => {});
+  cleanup(tabId);
 }
 
 export async function ensureAttached(tabId: number): Promise<void> {
   if (attached.has(tabId)) return;
+  await canceledLoaded;
   if (canceledByUser.has(tabId)) {
     throw new BridgeError(
       "BLOCKED_BY_POLICY",
@@ -118,7 +135,10 @@ function remoteObjectText(arg: any): string {
 
 chrome.debugger.onDetach.addListener((source, reason) => {
   if (source.tabId === undefined) return;
-  if (reason === "canceled_by_user") canceledByUser.add(source.tabId);
+  if (reason === "canceled_by_user") {
+    canceledByUser.add(source.tabId);
+    void saveCanceled();
+  }
   cleanup(source.tabId);
 });
 
@@ -155,7 +175,7 @@ chrome.debugger.onEvent.addListener((source, method, params: any) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  canceledByUser.delete(tabId);
+  if (canceledByUser.delete(tabId)) void saveCanceled();
   consoleBuffers.delete(tabId);
   if (attached.has(tabId)) cleanup(tabId);
 });

@@ -33,6 +33,18 @@ describe("validateUploadPaths", () => {
     expect(() => validateUploadPaths([link], open)).toThrow(/not allowed/);
   });
 
+  it("refuses case variants on case-insensitive file systems", () => {
+    if (process.platform !== "darwin" && process.platform !== "win32") return;
+    expect(() => validateUploadPaths([join(dir, ".ENV")], open)).toThrow(/not allowed/);
+  });
+
+  it("refuses private keys and certificates by name", () => {
+    writeFileSync(join(dir, "id_ed25519_work"), "k");
+    writeFileSync(join(dir, "server.PEM"), "k");
+    expect(() => validateUploadPaths([join(dir, "id_ed25519_work")], open)).toThrow(/not allowed/);
+    expect(() => validateUploadPaths([join(dir, "server.PEM")], open)).toThrow(/not allowed/);
+  });
+
   it("refuses ~/.ssh", () => {
     // Only meaningful if the file exists; the check runs after resolving the path.
     const key = join(homedir(), ".ssh", "known_hosts");

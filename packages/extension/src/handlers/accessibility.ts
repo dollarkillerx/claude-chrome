@@ -51,6 +51,13 @@ interface RefTable {
 const refTables = new Map<number, RefTable>();
 
 onDetached((tabId) => refTables.delete(tabId));
+// Backend node ids are per renderer and can be reused after a navigation, so a stale ref could
+// silently point at an unrelated element. Drop the table on every main-frame navigation.
+chrome.debugger.onEvent.addListener((source, method, params: any) => {
+  if (method === "Page.frameNavigated" && !params.frame?.parentId && source.tabId !== undefined) {
+    refTables.delete(source.tabId);
+  }
+});
 chrome.tabs.onRemoved.addListener((tabId) => refTables.delete(tabId));
 
 function refFor(tabId: number, backendId: number): string {

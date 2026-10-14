@@ -15,7 +15,13 @@ export function loadOrCreateToken(): string {
   }
   mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
   const token = randomBytes(24).toString("base64url");
-  writeFileSync(TOKEN_PATH, token + "\n", { mode: 0o600 });
+  try {
+    // "wx": if two sessions start at once on first run, only one token wins and both read it.
+    writeFileSync(TOKEN_PATH, token + "\n", { mode: 0o600, flag: "wx" });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    return readFileSync(TOKEN_PATH, "utf8").trim();
+  }
   chmodSync(TOKEN_PATH, 0o600);
   return token;
 }

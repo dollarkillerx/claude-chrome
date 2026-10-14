@@ -24,23 +24,26 @@ async function main(): Promise<void> {
   }
 
   const port = Number(process.env.CLAUDE_CHROME_PORT ?? DEFAULT_PORT);
+  const uploadPolicy = uploadPolicyFromEnv();
   const manager = new BridgeManager({
     port,
     token,
+    uploadPolicy,
     extensionId: process.env.CLAUDE_CHROME_EXTENSION_ID,
     pairingHint: `Install/enable the extension and paste the token from ${TOKEN_PATH} into its popup (port ${port}).`,
     log: stderrLogger,
   });
 
   const server = new McpServer({ name: "local-chrome", version: VERSION });
-  registerTools(server, manager, uploadPolicyFromEnv());
+  registerTools(server, manager, uploadPolicy);
   await server.connect(new StdioServerTransport());
 
   // Claim the port right away so the extension can connect before the first tool call.
   manager.get().catch((error) => stderrLogger(`bridge startup failed: ${error.message}`));
 
   const shutdown = async () => {
-    await manager.close().catch(() => {});
+    // Give the hub a moment to tell the extension this session ended, but never hang on exit.
+    await Promise.race([manager.close().catch(() => {}), new Promise((r) => setTimeout(r, 2000))]);
     process.exit(0);
   };
   process.stdin.on("close", shutdown);

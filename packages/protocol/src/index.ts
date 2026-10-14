@@ -2,7 +2,7 @@
 // All messages are JSON objects sent over a single WebSocket.
 
 export const DEFAULT_PORT = 18765;
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 export type Role = "extension" | "peer";
 
@@ -13,6 +13,8 @@ export interface HelloMessage {
   protocol: number;
   /** Free-form client description, e.g. extension version / user agent. */
   client?: string;
+  /** Peers only: the session this connection speaks for. The hub binds it to the socket. */
+  session?: string;
 }
 
 export interface WelcomeMessage {
@@ -32,6 +34,22 @@ export interface RequestMessage {
 /** Hub → extension: a Claude session went away, so its tab bookkeeping can be dropped. */
 export interface SessionEndMessage {
   type: "session_end";
+  session: string;
+}
+
+/**
+ * Hub → extension, right after the extension connects: the sessions currently alive behind this hub.
+ * Sessions the extension knows about that are not announced (here or via session_start) within a
+ * grace period belonged to a process that died, and are released.
+ */
+export interface SessionsMessage {
+  type: "sessions";
+  sessions: string[];
+}
+
+/** Hub → extension: a (re)connected peer announced its session. */
+export interface SessionStartMessage {
+  type: "session_start";
   session: string;
 }
 
@@ -56,6 +74,8 @@ export type Message =
   | RequestMessage
   | ResponseMessage
   | SessionEndMessage
+  | SessionsMessage
+  | SessionStartMessage
   | PingMessage
   | PongMessage;
 

@@ -15,7 +15,7 @@ afterEach(async () => {
 });
 
 async function startHub(extra: Partial<Parameters<typeof Hub.start>[0]> = {}) {
-  const hub = await Hub.start({ port: 0, token: TOKEN, log, extensionWaitMs: 300, ...extra });
+  const hub = await Hub.start({ port: 0, token: TOKEN, log, extensionWaitMs: 300, session: "hub-session", ...extra });
   cleanups.push(() => hub.close());
   return hub;
 }
@@ -125,7 +125,7 @@ describe("sessions", () => {
     const hub = await startHub();
     const seen: Message[] = [];
     await connectExtension(hub.port, { seen });
-    const peer = await Peer.connect({ port: hub.port, token: TOKEN, log });
+    const peer = await Peer.connect({ port: hub.port, token: TOKEN, session: "peer-session", log });
     cleanups.push(() => peer.close());
     await hub.call("tabs_list", {}, "hub-session");
     await peer.call("tabs_list", {}, "peer-session");
@@ -133,12 +133,77 @@ describe("sessions", () => {
     expect(sessions).toEqual(["hub-session", "peer-session"]);
   });
 
+  it("binds the peer's session at hello and ignores what requests claim", async () => {
+    const hub = await startHub();
+    const seen: Message[] = [];
+    await connectExtension(hub.port, { seen });
+    const peer = await Peer.connect({ port: hub.port, token: TOKEN, session: "peer-session", log });
+    cleanups.push(() => peer.close());
+    await peer.call("tabs_list", {}, "hub-session"); // impersonation attempt
+    const request = seen.find((m) => m.type === "request") as { session: string };
+    expect(request.session).toBe("peer-session");
+  });
+
+  it("rejects a second peer claiming an already connected session", async () => {
+    const hub = await startHub();
+    const first = await Peer.connect({ port: hub.port, token: TOKEN, session: "dup", log });
+    cleanups.push(() => first.close());
+    await expect(Peer.connect({ port: hub.port, token: TOKEN, session: "dup", log })).rejects.toMatchObject({
+      code: "UNAUTHORIZED",
+    });
+    await expect(Peer.connect({ port: hub.port, token: TOKEN, session: "hub-session", log })).rejects.toMatchObject({
+      code: "UNAUTHORIZED",
+    });
+  });
+
+  it("announces live sessions when the extension connects, and new peers as they arrive", async () => {
+    const hub = await startHub();
+    const early = await Peer.connect({ port: hub.port, token: TOKEN, session: "early", log });
+    cleanups.push(() => early.close());
+    const seen: Message[] = [];
+    await connectExtension(hub.port, { seen });
+    const late = await Peer.connect({ port: hub.port, token: TOKEN, session: "late", log });
+    cleanups.push(() => late.close());
+    await new Promise((r) => setTimeout(r, 100));
+    expect(seen).toContainEqual({ type: "sessions", sessions: ["hub-session", "early"] });
+    expect(seen).toContainEqual({ type: "session_start", session: "late" });
+  });
+
+  it("ends the hub's own session when the hub shuts down", async () => {
+    const hub = await Hub.start({ port: 0, token: TOKEN, log, session: "hub-session" });
+    const seen: Message[] = [];
+    await connectExtension(hub.port, { seen });
+    await hub.close();
+    await new Promise((r) => setTimeout(r, 100));
+    expect(seen).toContainEqual({ type: "session_end", session: "hub-session" });
+  });
+
+  it("re-validates file_upload paths relayed from peers", async () => {
+    const hub = await startHub({ uploadPolicy: { allowedDirs: [] } });
+    await connectExtension(hub.port);
+    const peer = await Peer.connect({ port: hub.port, token: TOKEN, session: "peer-session", log });
+    cleanups.push(() => peer.close());
+    await expect(peer.call("file_upload", { paths: ["relative.txt"] }, "x")).rejects.toMatchObject({ code: "BAD_REQUEST" });
+  });
+
+  it("rejects mismatched protocol versions", async () => {
+    const hub = await startHub();
+    const closeCode = await new Promise<number>((resolve) => {
+      const socket = new WebSocket(`ws://127.0.0.1:${hub.port}`, { origin: EXT_ORIGIN });
+      cleanups.push(() => socket.terminate());
+      socket.on("open", () =>
+        socket.send(JSON.stringify({ type: "hello", role: "extension", token: TOKEN, protocol: PROTOCOL_VERSION - 1 })),
+      );
+      socket.on("close", (code) => resolve(code));
+    });
+    expect(closeCode).toBe(CLOSE_UNAUTHORIZED);
+  });
+
   it("notifies the extension when a peer session goes away", async () => {
     const hub = await startHub();
     const seen: Message[] = [];
     await connectExtension(hub.port, { seen });
-    const peer = await Peer.connect({ port: hub.port, token: TOKEN, log });
-    await peer.call("tabs_list", {}, "peer-session");
+    const peer = await Peer.connect({ port: hub.port, token: TOKEN, session: "peer-session", log });
     await peer.close();
     await new Promise((r) => setTimeout(r, 100));
     expect(seen).toContainEqual({ type: "session_end", session: "peer-session" });
@@ -149,14 +214,14 @@ describe("Peer", () => {
   it("relays calls through the hub", async () => {
     const hub = await startHub();
     await connectExtension(hub.port);
-    const peer = await Peer.connect({ port: hub.port, token: TOKEN, log });
+    const peer = await Peer.connect({ port: hub.port, token: TOKEN, session: "peer-session", log });
     cleanups.push(() => peer.close());
     await expect(peer.call("find", { query: "q" }, "s1")).resolves.toEqual({ method: "find", params: { query: "q" } });
   });
 
   it("is rejected with a wrong token", async () => {
     const hub = await startHub();
-    await expect(Peer.connect({ port: hub.port, token: "bad", log })).rejects.toMatchObject({ code: "UNAUTHORIZED" });
+    await expect(Peer.connect({ port: hub.port, token: "bad", session: "peer-session", log })).rejects.toMatchObject({ code: "UNAUTHORIZED" });
   });
 });
 

@@ -1,5 +1,5 @@
 import { BridgeError } from "@claude-chrome/protocol";
-import { allowReattach } from "./cdp";
+import { allowReattach, detachTab } from "./cdp";
 import { checkUrl } from "./policy";
 
 /** Per Claude session: its own window, tab group, current tab and owned tabs. */
@@ -19,16 +19,19 @@ interface TabState {
 
 const GROUP_COLORS = ["orange", "blue", "green", "purple", "cyan", "pink", "yellow", "red"] as const;
 
-let cache: TabState | null = null;
+/** How long sessions get to re-announce themselves after a hub (re)connects before they count as dead. */
+const ORPHAN_GRACE_MS = 15_000;
+
+let loading: Promise<TabState> | null = null;
 let queue: Promise<unknown> = Promise.resolve();
 
-async function load(): Promise<TabState> {
-  if (!cache) {
-    const { tabState } = await chrome.storage.session.get("tabState");
+/** Memoized so concurrent cold-start callers share one read instead of racing (and clobbering) each other. */
+function load(): Promise<TabState> {
+  loading ??= chrome.storage.session.get("tabState").then(({ tabState }) => {
     const stored = tabState as Partial<TabState> | undefined;
-    cache = { sessions: stored?.sessions ?? {}, nextLabel: stored?.nextLabel ?? 1 };
-  }
-  return cache;
+    return { sessions: stored?.sessions ?? {}, nextLabel: stored?.nextLabel ?? 1 };
+  });
+  return loading;
 }
 
 /**
@@ -73,8 +76,15 @@ export async function tabOwners(session: string): Promise<(tabId: number) => str
   };
 }
 
-/** Resolves the tab a call should act on, enforcing session ownership and the URL policy. */
-export async function resolveTab(session: string, tabId?: number): Promise<chrome.tabs.Tab & { id: number }> {
+/**
+ * Resolves the tab a call should act on, enforcing session ownership and the URL policy.
+ * `skipPolicy` is for leaving a blocked page (navigate away, close) so a tab can never get stuck.
+ */
+export async function resolveTab(
+  session: string,
+  tabId?: number,
+  { skipPolicy = false }: { skipPolicy?: boolean } = {},
+): Promise<chrome.tabs.Tab & { id: number }> {
   const state = await load();
   const id = tabId ?? state.sessions[session]?.currentTabId;
   if (id === undefined) {
@@ -90,17 +100,24 @@ export async function resolveTab(session: string, tabId?: number): Promise<chrom
       `Tab ${id} belongs to another Claude session (${state.sessions[owner].label}). Open your own tab with tabs_create.`,
     );
   }
+  if (!owner) {
+    // The user's own tabs must be claimed explicitly, so two sessions can never drive the same tab.
+    throw new BridgeError(
+      "NO_TAB_SELECTED",
+      `Tab ${id} is not one of this session's tabs. Call tabs_select with tabId ${id} first (only if the user wants Claude to use it).`,
+    );
+  }
   let tab: chrome.tabs.Tab;
   try {
     tab = await chrome.tabs.get(id);
   } catch {
     throw new BridgeError("TAB_NOT_FOUND", `Tab ${id} does not exist (it may have been closed).`);
   }
-  await checkUrl(tab.url || tab.pendingUrl);
+  if (!skipPolicy) await checkUrl(tab.url || tab.pendingUrl);
   return tab as chrome.tabs.Tab & { id: number };
 }
 
-/** Makes a tab current for the session. Tabs of other sessions need `takeOver`. */
+/** Makes a tab current for the session, claiming it. Tabs of other sessions need `takeOver`. */
 export function selectTab(session: string, tabId: number, takeOver: boolean): Promise<void> {
   return mutate((state) => {
     const owner = ownerOf(state, tabId);
@@ -114,10 +131,11 @@ export function selectTab(session: string, tabId: number, takeOver: boolean): Pr
       const previous = state.sessions[owner];
       previous.tabs = previous.tabs.filter((id) => id !== tabId);
       if (previous.currentTabId === tabId) previous.currentTabId = undefined;
-      sessionOf(state, session).tabs.push(tabId);
     }
-    sessionOf(state, session).currentTabId = tabId;
-    allowReattach(tabId);
+    const s = sessionOf(state, session);
+    if (!s.tabs.includes(tabId)) s.tabs.push(tabId);
+    s.currentTabId = tabId;
+    void allowReattach(tabId);
   });
 }
 
@@ -125,21 +143,21 @@ export function selectTab(session: string, tabId: number, takeOver: boolean): Pr
  * Opens a tab in the session's own window (creating the window on first use) and groups it
  * under the session's label, so concurrent sessions never fight over the active tab.
  */
-export function openSessionTab(session: string): Promise<chrome.tabs.Tab & { id: number }> {
+export function openSessionTab(session: string, url = "about:blank"): Promise<chrome.tabs.Tab & { id: number }> {
   return mutate(async (state) => {
     const s = sessionOf(state, session);
     let tab: chrome.tabs.Tab | undefined;
     if (s.windowId !== undefined) {
       try {
         await chrome.windows.get(s.windowId);
-        tab = await chrome.tabs.create({ windowId: s.windowId, url: "about:blank", active: true });
+        tab = await chrome.tabs.create({ windowId: s.windowId, url, active: true });
       } catch {
         s.windowId = undefined; // window was closed
         s.groupId = undefined;
       }
     }
     if (!tab) {
-      const win = await chrome.windows.create({ url: "about:blank", focused: true });
+      const win = await chrome.windows.create({ url, focused: true });
       s.windowId = win?.id;
       tab = win?.tabs?.[0];
       if (!tab?.id) throw new BridgeError("INTERNAL", "Failed to open a window");
@@ -173,11 +191,42 @@ async function groupTab(state: TabState, s: SessionState, tabId: number): Promis
   }
 }
 
-/** Called when the hub reports a session ended. Tabs stay open for the user; ownership is released. */
+/** Drops a session: its tabs stay open for the user, but ownership is released and the debugger detached. */
+function releaseSession(state: TabState, session: string): void {
+  const s = state.sessions[session];
+  if (!s) return;
+  for (const tabId of s.tabs) void detachTab(tabId);
+  delete state.sessions[session];
+}
+
+/** Called when the hub reports a session ended. */
 export function endSession(session: string): Promise<void> {
-  return mutate((state) => {
-    delete state.sessions[session];
-  });
+  return mutate((state) => releaseSession(state, session));
+}
+
+let announced: Set<string> | null = null;
+let sweepTimer: ReturnType<typeof setTimeout> | undefined;
+
+/**
+ * A hub just connected and listed its live sessions. Sessions we know that don't show up within the
+ * grace period (peers re-electing may announce a little later) belonged to a process that died.
+ */
+export function sessionsAnnounced(sessions: string[]): void {
+  announced = new Set(sessions);
+  clearTimeout(sweepTimer);
+  sweepTimer = setTimeout(() => {
+    const alive = announced;
+    announced = null;
+    if (!alive) return;
+    void mutate((state) => {
+      for (const session of Object.keys(state.sessions)) if (!alive.has(session)) releaseSession(state, session);
+    });
+  }, ORPHAN_GRACE_MS);
+}
+
+/** A session showed signs of life (session_start or a request). */
+export function sessionAlive(session: string): void {
+  announced?.add(session);
 }
 
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -204,8 +253,9 @@ chrome.windows.onRemoved.addListener((windowId) => {
  * Resolves once the tab finishes loading. Must be created *before* triggering the navigation.
  * Never rejects: on timeout it resolves with `false` so the caller can report "still loading".
  */
-export function waitForLoad(tabId: number, timeoutMs = 30_000): Promise<boolean> {
-  return new Promise((resolve) => {
+export function waitForLoad(tabId: number, timeoutMs = 30_000): Promise<boolean> & { cancel(): void } {
+  let cancel = () => {};
+  const promise = new Promise<boolean>((resolve) => {
     const started = Date.now();
     let sawLoading = false;
     const finish = (ok: boolean) => {
@@ -227,5 +277,7 @@ export function waitForLoad(tabId: number, timeoutMs = 30_000): Promise<boolean>
       if (!tab || tab.status === "complete") finish(Boolean(tab));
     }, 250);
     const timer = setTimeout(() => finish(false), timeoutMs);
+    cancel = () => finish(false);
   });
+  return Object.assign(promise, { cancel });
 }

@@ -3,10 +3,12 @@ import type { Method } from "@claude-chrome/protocol";
 import type { Bridge, Logger } from "./bridge.js";
 import { Hub } from "./hub.js";
 import { Peer } from "./peer.js";
+import type { UploadPolicy } from "./uploads.js";
 
 export interface ManagerOptions {
   port: number;
   token: string;
+  uploadPolicy?: UploadPolicy;
   extensionId?: string;
   pairingHint?: string;
   log: Logger;
@@ -57,12 +59,14 @@ export class BridgeManager {
         token,
         extensionId: this.opts.extensionId,
         pairingHint: this.opts.pairingHint,
+        session: this.sessionId,
+        uploadPolicy: this.opts.uploadPolicy,
         log,
       });
       log(`listening on ws://127.0.0.1:${port} as hub`);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
-      bridge = await Peer.connect({ port, token, log });
+      bridge = await Peer.connect({ port, token, session: this.sessionId, log });
     }
     this.bridge = bridge;
     bridge.onClose(() => {

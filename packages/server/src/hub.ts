@@ -14,6 +14,7 @@ import {
 } from "@claude-chrome/protocol";
 import { EXTENSION_WAIT_MS, timeoutFor, type Bridge, type Logger } from "./bridge.js";
 import { tokensEqual } from "./token.js";
+import { validateUploadPaths, type UploadPolicy } from "./uploads.js";
 
 export interface HubOptions {
   port: number;
@@ -23,6 +24,10 @@ export interface HubOptions {
   extensionWaitMs?: number;
   /** Hint appended to NOT_CONNECTED errors. */
   pairingHint?: string;
+  /** This process's own Claude session id. */
+  session: string;
+  /** Re-applied to file_upload calls relayed from peers, so a peer can't skip the policy. */
+  uploadPolicy?: UploadPolicy;
   log: Logger;
 }
 
@@ -34,6 +39,8 @@ interface Pending {
 
 const HELLO_TIMEOUT_MS = 5_000;
 const STALE_EXTENSION_MS = 60_000;
+const MAYBE_PERFORMED =
+  "The action may already have been performed; check the page state (e.g. screenshot or read_page) before retrying.";
 
 /**
  * The hub owns the localhost WebSocket port. The extension connects to it, and so do
@@ -44,7 +51,8 @@ export class Hub implements Bridge {
   private extension: WebSocket | null = null;
   private extensionClient = "";
   private extensionLastSeen = 0;
-  private peers = new Set<WebSocket>();
+  /** Peer socket → the session it speaks for (bound at hello, so peers can't impersonate others). */
+  private peers = new Map<WebSocket, string>();
   private pending = new Map<number, Pending>();
   private nextId = 1;
   private extensionWaiters: Array<() => void> = [];
@@ -89,11 +97,11 @@ export class Hub implements Bridge {
 
   async call(method: Method, params: Record<string, unknown>, session: string): Promise<unknown> {
     if (method === "status" && !this.extension) {
-      return { hub: true, peers: this.peers.size, extensionConnected: false };
+      return { sessionsOnHub: this.peers.size + 1, extensionConnected: false };
     }
     const result = await this.forward(method, params, session);
     if (method === "status") {
-      return { hub: true, peers: this.peers.size, extensionConnected: true, ...(result as object) };
+      return { sessionsOnHub: this.peers.size + 1, extensionConnected: true, ...(result as object) };
     }
     return result;
   }
@@ -104,8 +112,13 @@ export class Hub implements Bridge {
 
   async close(): Promise<void> {
     clearInterval(this.staleTimer);
-    this.rejectAll(new BridgeError("NOT_CONNECTED", "Hub shutting down"));
-    for (const client of this.wss.clients) client.terminate();
+    this.rejectAll(new BridgeError("NOT_CONNECTED", `Hub shutting down. ${MAYBE_PERFORMED}`));
+    // Release this session's tabs in the extension; close() flushes the queued message first.
+    this.sendToExtension({ type: "session_end", session: this.opts.session });
+    for (const client of this.wss.clients) {
+      if (client === this.extension) client.close(1001, "hub shutting down");
+      else client.terminate();
+    }
     await new Promise<void>((resolve) => this.wss.close(() => resolve()));
     await new Promise<void>((resolve) => this.http.close(() => resolve()));
     for (const listener of this.closeListeners.splice(0)) listener();
@@ -119,6 +132,11 @@ export class Hub implements Bridge {
         this.pending.delete(id);
         reject(new BridgeError("TIMEOUT", `${method} timed out after ${timeoutFor(method) / 1000}s`));
       }, timeoutFor(method));
+      if (socket.readyState !== socket.OPEN) {
+        clearTimeout(timer);
+        reject(new BridgeError("NOT_CONNECTED", "Chrome extension disconnected; retry the call."));
+        return;
+      }
       this.pending.set(id, { resolve, reject, timer });
       const request: RequestMessage = { type: "request", id, method, params, session };
       socket.send(JSON.stringify(request));
@@ -163,13 +181,16 @@ export class Hub implements Bridge {
       }
       socket.send(JSON.stringify({ type: "welcome", protocol: PROTOCOL_VERSION }));
       if (hello!.role === "extension") this.attachExtension(socket, hello!.client ?? "");
-      else this.attachPeer(socket);
+      else this.attachPeer(socket, hello!.session!);
     });
   }
 
   private checkHello(hello: HelloMessage, origin: string | undefined): string | null {
     if (hello.type !== "hello" || typeof hello.token !== "string") return "malformed hello";
     if (!tokensEqual(hello.token, this.opts.token)) return "invalid token";
+    if (hello.protocol !== PROTOCOL_VERSION) {
+      return `protocol version mismatch (got ${hello.protocol}, hub speaks ${PROTOCOL_VERSION}); rebuild and reload`;
+    }
     if (hello.role === "extension") {
       if (!origin?.startsWith("chrome-extension://")) return "extension must connect from a chrome-extension:// origin";
       if (this.opts.extensionId && origin !== `chrome-extension://${this.opts.extensionId}`) {
@@ -179,7 +200,12 @@ export class Hub implements Bridge {
     }
     if (hello.role === "peer") {
       // Peers are local Node processes; browsers always send an Origin header.
-      return origin ? "peers must not send an Origin header" : null;
+      if (origin) return "peers must not send an Origin header";
+      if (typeof hello.session !== "string" || !hello.session) return "peers must announce a session";
+      if (hello.session === this.opts.session || [...this.peers.values()].includes(hello.session)) {
+        return "session already connected";
+      }
+      return null;
     }
     return "unknown role";
   }
@@ -188,6 +214,8 @@ export class Hub implements Bridge {
     if (this.extension) {
       this.opts.log("a new extension connection replaced the previous one");
       this.extension.close(CLOSE_REPLACED, "replaced by a newer connection");
+      // Calls in flight went to the old socket; fail them now instead of letting them time out.
+      this.rejectAll(new BridgeError("NOT_CONNECTED", `Chrome extension connection was replaced. ${MAYBE_PERFORMED}`));
     }
     this.extension = socket;
     this.extensionClient = client;
@@ -205,19 +233,21 @@ export class Hub implements Bridge {
       if (this.extension !== socket) return;
       this.extension = null;
       this.opts.log("extension disconnected");
-      this.rejectAll(new BridgeError("NOT_CONNECTED", "Chrome extension disconnected during the call"));
+      this.rejectAll(new BridgeError("NOT_CONNECTED", `Chrome extension disconnected during the call. ${MAYBE_PERFORMED}`));
     });
 
+    // Tell the extension which sessions are alive, so it can release tabs of sessions whose process died.
+    this.sendToExtension({ type: "sessions", sessions: [this.opts.session, ...this.peers.values()] });
     for (const waiter of this.extensionWaiters.splice(0)) waiter();
   }
 
-  private attachPeer(socket: WebSocket): void {
-    this.peers.add(socket);
-    const sessions = new Set<string>();
+  private attachPeer(socket: WebSocket, session: string): void {
+    this.peers.set(socket, session);
+    this.sendToExtension({ type: "session_start", session });
     socket.on("close", () => {
       this.peers.delete(socket);
-      // Let the extension forget the departed sessions' current tab / window bookkeeping.
-      for (const session of sessions) this.sendToExtension({ type: "session_end", session });
+      // Let the extension release the departed session's tabs and window.
+      this.sendToExtension({ type: "session_end", session });
     });
     socket.on("message", async (raw) => {
       const msg = parse(raw.toString());
@@ -230,9 +260,12 @@ export class Hub implements Bridge {
       const response: ResponseMessage = { type: "response", id: msg.id };
       try {
         if (!isMethod(msg.method)) throw new BridgeError("BAD_REQUEST", `Unknown method ${String(msg.method)}`);
-        if (typeof msg.session !== "string" || !msg.session) throw new BridgeError("BAD_REQUEST", "Missing session id");
-        sessions.add(msg.session);
-        response.result = await this.call(msg.method, msg.params ?? {}, msg.session);
+        const params = msg.params ?? {};
+        if (msg.method === "file_upload" && this.opts.uploadPolicy) {
+          params.paths = validateUploadPaths(params.paths, this.opts.uploadPolicy);
+        }
+        // Always the session bound at hello; whatever the request claims is ignored.
+        response.result = await this.call(msg.method, params, session);
       } catch (error) {
         response.error = toRpcError(error);
       }

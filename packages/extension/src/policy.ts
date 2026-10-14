@@ -1,13 +1,21 @@
 import { BridgeError } from "@claude-chrome/protocol";
 import { getSettings } from "./settings";
 
-const ALLOWED_PROTOCOLS = new Set(["http:", "https:", "file:", "data:"]);
+// file: is deliberately excluded: reading local files via get_page_text would bypass the
+// server's upload denylist (e.g. file:///Users/me/.ssh/id_rsa).
+const ALLOWED_PROTOCOLS = new Set(["http:", "https:", "data:"]);
 
 /** Hosts that are always off-limits (Chrome also refuses to debug the Web Store). */
 const ALWAYS_BLOCKED_HOSTS = ["chromewebstore.google.com", "chrome.google.com"];
 
 function hostMatches(host: string, pattern: string): boolean {
-  const p = pattern.trim().toLowerCase().replace(/^\*\./, "");
+  // Accept entries pasted as URLs ("https://bank.example/login") as well as bare hosts.
+  const p = pattern
+    .trim()
+    .toLowerCase()
+    .replace(/^[a-z][a-z0-9+.-]*:\/\//, "")
+    .replace(/[/:?#].*$/, "")
+    .replace(/^\*\./, "");
   return p !== "" && (host === p || host.endsWith("." + p));
 }
 
@@ -29,6 +37,14 @@ export async function checkUrl(url: string | undefined): Promise<void> {
   if (hit) {
     throw new BridgeError("BLOCKED_BY_POLICY", `${host} is blocked in the extension settings`);
   }
+}
+
+/** Non-throwing variant, e.g. to redact blocked tabs in tabs_list. */
+export async function isAllowed(url: string | undefined): Promise<boolean> {
+  return checkUrl(url).then(
+    () => true,
+    () => false,
+  );
 }
 
 /** Adds https:// when the URL has no scheme. */

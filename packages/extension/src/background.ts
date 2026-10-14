@@ -8,7 +8,7 @@ import {
 import { detachAll } from "./cdp";
 import { dispatch } from "./dispatcher";
 import { getSettings } from "./settings";
-import { endSession } from "./tabs";
+import { endSession, sessionAlive, sessionsAnnounced } from "./tabs";
 
 export type ConnectionState = "connected" | "connecting" | "disconnected" | "unauthorized" | "replaced" | "paused" | "no_token";
 
@@ -28,6 +28,8 @@ let heartbeat: ReturnType<typeof setInterval> | undefined;
 let retryTimer: ReturnType<typeof setTimeout> | undefined;
 let backoff = 1000;
 let status: ConnectionStatus = { state: "disconnected" };
+/** Set before the first await so overlapping triggers (startup, alarm, settings change) share one attempt. */
+let connecting: Promise<void> | null = null;
 
 function setStatus(next: ConnectionStatus): void {
   status = next;
@@ -43,15 +45,30 @@ function setStatus(next: ConnectionStatus): void {
   chrome.runtime.sendMessage({ type: "status", status }).catch(() => {}); // popup may be closed
 }
 
-async function connect(): Promise<void> {
+function connect(): Promise<void> {
+  connecting ??= openSocket().finally(() => {
+    connecting = null;
+  });
+  return connecting;
+}
+
+async function openSocket(): Promise<void> {
   if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
   clearTimeout(retryTimer);
   const settings = await getSettings();
   if (settings.paused) return setStatus({ state: "paused" });
   if (!settings.token) return setStatus({ state: "no_token", detail: "Paste the token from ~/.claude-chrome/token" });
+  if (!Number.isInteger(settings.port) || settings.port < 1 || settings.port > 65535) {
+    return setStatus({ state: "disconnected", detail: `Invalid port ${settings.port}` });
+  }
 
   setStatus({ state: "connecting", port: settings.port });
-  const ws = new WebSocket(`ws://127.0.0.1:${settings.port}`);
+  let ws: WebSocket;
+  try {
+    ws = new WebSocket(`ws://127.0.0.1:${settings.port}`);
+  } catch (error) {
+    return setStatus({ state: "disconnected", detail: String(error), port: settings.port });
+  }
   socket = ws;
 
   ws.onopen = () => {
@@ -79,7 +96,12 @@ async function connect(): Promise<void> {
       heartbeat = setInterval(() => ws.readyState === WebSocket.OPEN && ws.send('{"type":"ping"}'), HEARTBEAT_MS);
     } else if (msg.type === "session_end") {
       void endSession(msg.session);
+    } else if (msg.type === "sessions") {
+      sessionsAnnounced(msg.sessions);
+    } else if (msg.type === "session_start") {
+      sessionAlive(msg.session);
     } else if (msg.type === "request") {
+      sessionAlive(msg.session);
       const response = await dispatch(msg);
       if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(response));
     }

@@ -4,9 +4,35 @@ import { isAbsolute, resolve, sep } from "node:path";
 import { BridgeError } from "@claude-chrome/protocol";
 import { CONFIG_DIR } from "./token.js";
 
-/** Credential stores that should never leave the machine through a web form. */
-const DENIED_SEGMENTS = [".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".config/gcloud", "Library/Keychains"];
-const DENIED_NAMES = [/^\.env(\..*)?$/, /^\.netrc$/, /^\.npmrc$/, /^\.pypirc$/, /^id_(rsa|ed25519|ecdsa|dsa)$/];
+/** Common credential stores under $HOME that should never leave the machine through a web form. */
+const DENIED_SEGMENTS = [
+  ".ssh",
+  ".aws",
+  ".gnupg",
+  ".kube",
+  ".docker",
+  ".azure",
+  ".config/gcloud",
+  ".config/gh",
+  ".claude",
+  "Library/Keychains",
+  "Library/Application Support/Google/Chrome",
+  "Library/Cookies",
+];
+/** Matched case-insensitively against the file name, anywhere on disk. */
+const DENIED_NAMES = [
+  /^\.env(\..*)?$/,
+  /^\.netrc$/,
+  /^\.npmrc$/,
+  /^\.pypirc$/,
+  /^\.git-credentials$/,
+  /^\.(bash|zsh|python)_history$/,
+  /^id_(rsa|ed25519|ecdsa|dsa)/,
+  /\.(pem|key|p12|pfx|keychain)$/,
+];
+/** macOS and Windows file systems are case-insensitive by default, so compare case-folded paths there. */
+const CASE_INSENSITIVE = process.platform === "darwin" || process.platform === "win32";
+const fold = (path: string) => (CASE_INSENSITIVE ? path.toLowerCase() : path);
 const MAX_FILE_BYTES = 200 * 1024 * 1024;
 
 export interface UploadPolicy {
@@ -25,16 +51,19 @@ export function uploadPolicyFromEnv(env = process.env): UploadPolicy {
   };
 }
 
+/** realpathSync.native also canonicalizes letter case (the JS version keeps the input's case). */
 function realpathOrSelf(path: string): string {
   try {
-    return realpathSync(path);
+    return realpathSync.native(path);
   } catch {
     return path;
   }
 }
 
 function within(path: string, dir: string): boolean {
-  return path === dir || path.startsWith(dir.endsWith(sep) ? dir : dir + sep);
+  const p = fold(path);
+  const d = fold(dir);
+  return p === d || p.startsWith(d.endsWith(sep) ? d : d + sep);
 }
 
 /**
@@ -50,7 +79,7 @@ export function validateUploadPaths(paths: unknown, policy: UploadPolicy): strin
     if (!isAbsolute(expanded)) throw new BridgeError("BAD_REQUEST", `Path must be absolute: ${input}`);
     let real: string;
     try {
-      real = realpathSync(expanded);
+      real = realpathSync.native(expanded);
     } catch {
       throw new BridgeError("BAD_REQUEST", `File not found: ${input}`);
     }
@@ -59,7 +88,7 @@ export function validateUploadPaths(paths: unknown, policy: UploadPolicy): strin
     if (stat.size > MAX_FILE_BYTES) throw new BridgeError("BAD_REQUEST", `File larger than 200 MB: ${input}`);
 
     const relToHome = within(real, home) ? real.slice(home.length + 1) : null;
-    const name = real.split(sep).pop() ?? "";
+    const name = (real.split(sep).pop() ?? "").toLowerCase();
     const denied =
       within(real, realpathOrSelf(CONFIG_DIR)) ||
       DENIED_NAMES.some((re) => re.test(name)) ||

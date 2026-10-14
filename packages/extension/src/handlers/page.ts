@@ -8,14 +8,21 @@ interface EvaluateResponse {
   exceptionDetails?: { text: string; exception?: { description?: string } };
 }
 
-/** Runtime.evaluate with REPL semantics; throws JS_EXCEPTION if the code throws. */
-export async function evaluate(tabId: number, expression: string): Promise<unknown> {
+/** Below the hub's 30s timeout so the model gets a precise error instead of a generic one. */
+const EVAL_TIMEOUT_MS = 25_000;
+
+/**
+ * Runtime.evaluate with REPL semantics; throws JS_EXCEPTION if the code throws.
+ * `userGesture` is only granted for model-authored code (eval_js), not for internal reads.
+ */
+export async function evaluate(tabId: number, expression: string, { userGesture = false } = {}): Promise<unknown> {
   const response = await cdp<EvaluateResponse>(tabId, "Runtime.evaluate", {
     expression,
     awaitPromise: true,
     returnByValue: true,
     replMode: true,
-    userGesture: true,
+    userGesture,
+    timeout: EVAL_TIMEOUT_MS, // bounds synchronous execution
   });
   if (response.exceptionDetails) {
     const details = response.exceptionDetails;
@@ -30,7 +37,23 @@ export async function evaluate(tabId: number, expression: string): Promise<unkno
 export async function evalJs({ code, tabId }: Params, ctx: Context) {
   if (typeof code !== "string") throw new BridgeError("BAD_REQUEST", "code is required");
   const tab = await resolveTab(ctx.session, tabId);
-  const value = await evaluate(tab.id, code);
+  // Runtime.evaluate's timeout doesn't cover awaited promises, so race those separately.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const value = await Promise.race([
+    evaluate(tab.id, code, { userGesture: true }),
+    new Promise((_, reject) => {
+      timer = setTimeout(
+        () => reject(new BridgeError("TIMEOUT", `eval_js did not finish within ${EVAL_TIMEOUT_MS / 1000}s`)),
+        EVAL_TIMEOUT_MS,
+      );
+    }),
+  ]).catch((error) => {
+    // Chrome garbage-collects never-settling promises and reports it as an error.
+    if (/Promise was collected/.test(String(error?.message))) {
+      throw new BridgeError("TIMEOUT", "eval_js awaited a promise that never settled");
+    }
+    throw error;
+  }).finally(() => clearTimeout(timer));
   // Always JSON-encode so an empty string ("") is distinguishable from no output.
   return value === undefined ? "undefined" : JSON.stringify(value, null, 2);
 }

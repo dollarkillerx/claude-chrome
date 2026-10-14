@@ -13,6 +13,8 @@ import { parse } from "./hub.js";
 export interface PeerOptions {
   port: number;
   token: string;
+  /** This process's Claude session id, bound to the connection by the hub. */
+  session: string;
   log: Logger;
 }
 
@@ -23,6 +25,7 @@ interface Pending {
 }
 
 const HEARTBEAT_MS = 20_000;
+const HANDSHAKE_TIMEOUT_MS = 5_000;
 
 /** Used when another Claude session already owns the port: relays calls through that hub. */
 export class Peer implements Bridge {
@@ -50,25 +53,43 @@ export class Peer implements Bridge {
       clearInterval(this.heartbeat);
       for (const [id, pending] of this.pending) {
         clearTimeout(pending.timer);
-        pending.reject(new BridgeError("NOT_CONNECTED", "Lost connection to the hub; retry the call"));
+        pending.reject(
+          new BridgeError(
+            "NOT_CONNECTED",
+            "Lost connection to the hub. The action may already have been performed; check the page state before retrying.",
+          ),
+        );
         this.pending.delete(id);
       }
       this.opts.log("disconnected from hub");
       for (const listener of this.closeListeners.splice(0)) listener();
     });
+    socket.on("error", (error) => this.opts.log(`hub connection error: ${error.message}`));
     this.heartbeat = setInterval(() => socket.send(JSON.stringify({ type: "ping" })), HEARTBEAT_MS);
     this.heartbeat.unref();
   }
 
   static connect(opts: PeerOptions): Promise<Peer> {
     return new Promise((resolve, reject) => {
-      const socket = new WebSocket(`ws://127.0.0.1:${opts.port}`);
+      const socket = new WebSocket(`ws://127.0.0.1:${opts.port}`, { handshakeTimeout: HANDSHAKE_TIMEOUT_MS });
       let welcomed = false;
+      // Something may accept TCP but never answer (wedged hub, foreign service): don't hang the election.
+      const timer = setTimeout(() => {
+        socket.terminate();
+        reject(new Error(`No hub answered on port ${opts.port} within ${HANDSHAKE_TIMEOUT_MS / 1000}s`));
+      }, HANDSHAKE_TIMEOUT_MS);
       socket.once("open", () => {
-        const hello: HelloMessage = { type: "hello", role: "peer", token: opts.token, protocol: PROTOCOL_VERSION };
+        const hello: HelloMessage = {
+          type: "hello",
+          role: "peer",
+          token: opts.token,
+          protocol: PROTOCOL_VERSION,
+          session: opts.session,
+        };
         socket.send(JSON.stringify(hello));
       });
       socket.once("message", (raw) => {
+        clearTimeout(timer);
         const msg = parse(raw.toString());
         if (msg?.type !== "welcome") {
           socket.terminate();
@@ -80,6 +101,7 @@ export class Peer implements Bridge {
         resolve(new Peer(socket, opts));
       });
       socket.once("close", (code, reason) => {
+        clearTimeout(timer);
         if (welcomed) return;
         reject(
           code === CLOSE_UNAUTHORIZED
@@ -88,6 +110,7 @@ export class Peer implements Bridge {
         );
       });
       socket.once("error", (error) => {
+        clearTimeout(timer);
         if (!welcomed) reject(error);
       });
     });

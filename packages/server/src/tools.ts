@@ -141,7 +141,7 @@ const TOOLS: Record<Method, ToolDef> = {
   },
   file_upload: {
     description:
-      "Upload local files into a file input without opening the OS file picker. ref may be the <input type=file> itself or a button/area that opens a file chooser; omit ref if the page has exactly one file input (hidden inputs included). Credential files (~/.ssh, .env, …) are refused.",
+      "Upload local files into a file input without opening the OS file picker. ref may be the <input type=file> itself or a button/area that opens a file chooser; omit ref if the page has exactly one file input (hidden inputs included). Common credential files (~/.ssh, ~/.aws, .env, private keys, …) are refused; only upload files the user asked for.",
     inputSchema: {
       paths: z.array(z.string()).min(1).describe("Absolute local file paths (~ allowed)."),
       ref,

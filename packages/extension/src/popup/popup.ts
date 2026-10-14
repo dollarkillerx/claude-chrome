@@ -45,7 +45,9 @@ async function init(): Promise<void> {
   });
 
   $("save").addEventListener("click", async () => {
-    const port = Number($<HTMLInputElement>("port").value) || settings.port;
+    const entered = Number($<HTMLInputElement>("port").value);
+    const port = Number.isInteger(entered) && entered >= 1 && entered <= 65535 ? entered : settings.port;
+    $<HTMLInputElement>("port").value = String(port);
     const blockedHosts = $<HTMLTextAreaElement>("blocked")
       .value.split(/\s+/)
       .map((h) => h.trim())
