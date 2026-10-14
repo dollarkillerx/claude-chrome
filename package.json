@@ -1,0 +1,15 @@
+{
+  "name": "claude-chrome",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "e2e": "pnpm --filter @claude-chrome/server e2e",
+    "token": "node packages/server/dist/index.js token"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  }
+}

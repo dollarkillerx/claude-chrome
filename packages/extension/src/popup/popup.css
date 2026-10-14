@@ -1,0 +1,114 @@
+:root {
+  --bg: #ffffff;
+  --fg: #1f2328;
+  --muted: #656d76;
+  --border: #d0d7de;
+  --accent: #d97757;
+  --accent-fg: #ffffff;
+  --field: #f6f8fa;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1c1c1e;
+    --fg: #e6edf3;
+    --muted: #9198a1;
+    --border: #3d444d;
+    --field: #262629;
+  }
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  width: 320px;
+  margin: 0;
+  padding: 14px;
+  font: 13px/1.4 -apple-system, BlinkMacSystemFont, "PingFang SC", "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+}
+header {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding-bottom: 12px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+}
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: none;
+}
+.dot.connected { background: #16a34a; }
+.dot.connecting { background: #d97706; }
+.dot.unauthorized, .dot.replaced { background: #dc2626; }
+.state {
+  font-weight: 600;
+}
+.detail, .hint {
+  color: var(--muted);
+  font-size: 12px;
+}
+.hint {
+  margin: 4px 0 0;
+}
+label {
+  display: block;
+  margin: 12px 0 4px;
+  font-weight: 500;
+}
+input, textarea {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--field);
+  color: var(--fg);
+  font: inherit;
+}
+textarea {
+  resize: vertical;
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 12px;
+}
+.row {
+  display: flex;
+  gap: 6px;
+}
+code {
+  font-family: ui-monospace, Menlo, monospace;
+}
+button {
+  padding: 7px 10px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: var(--accent);
+  color: var(--accent-fg);
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+}
+button.secondary {
+  background: transparent;
+  color: var(--fg);
+  border-color: var(--border);
+}
+button.ghost {
+  background: transparent;
+  color: var(--muted);
+  border-color: var(--border);
+}
+button.wide {
+  width: 100%;
+  margin-top: 8px;
+}
+.actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 14px;
+}

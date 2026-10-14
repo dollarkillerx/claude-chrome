@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <span id="dot" class="dot"></span>
+      <div>
+        <div id="state" class="state">…</div>
+        <div id="detail" class="detail"></div>
+      </div>
+    </header>
+
+    <label for="token">配对 Token</label>
+    <div class="row">
+      <input id="token" type="password" placeholder="粘贴 ~/.claude-chrome/token 的内容" autocomplete="off" spellcheck="false" />
+      <button id="toggleToken" class="ghost" title="显示/隐藏">👁</button>
+    </div>
+    <p class="hint">在终端运行 <code>cat ~/.claude-chrome/token</code> 获取</p>
+
+    <label for="port">端口</label>
+    <input id="port" type="number" min="1" max="65535" />
+
+    <label for="blocked">禁止访问的站点（每行一个域名，含子域名）</label>
+    <textarea id="blocked" rows="3" placeholder="bank.example.com"></textarea>
+
+    <div class="actions">
+      <button id="save">保存并连接</button>
+      <button id="pause" class="secondary">暂停控制</button>
+    </div>
+    <button id="detach" class="ghost wide">立即断开所有标签页的调试</button>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

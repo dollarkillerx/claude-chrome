@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Local Chrome for Claude",
+  "version": "0.1.0",
+  "description": "Let Claude Code (or any MCP client) control this Chrome through a local MCP bridge — no account pairing.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "debugger",
+    "tabs",
+    "tabGroups",
+    "storage",
+    "alarms"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Local Chrome for Claude"
+  }
+}
