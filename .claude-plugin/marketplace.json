@@ -1,0 +1,20 @@
+{
+  "name": "claude-chrome",
+  "owner": {
+    "name": "dollarkillerx",
+    "url": "https://github.com/dollarkillerx"
+  },
+  "metadata": {
+    "description": "Control your local Chrome from Claude Code without account pairing."
+  },
+  "plugins": [
+    {
+      "name": "local-chrome",
+      "source": "./",
+      "description": "Skill for driving your own local Chrome through the local-chrome MCP server.",
+      "version": "0.1.0",
+      "category": "productivity",
+      "keywords": ["chrome", "browser", "automation", "mcp"]
+    }
+  ]
+}

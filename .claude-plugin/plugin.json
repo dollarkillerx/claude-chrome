@@ -1,0 +1,12 @@
+{
+  "name": "local-chrome",
+  "version": "0.1.0",
+  "description": "Skill for driving your own local Chrome (real profile and sign-ins) through the local-chrome MCP server: connection checks, own-tab etiquette, refs and screenshots, iframes, uploads, error codes, and safety rules.",
+  "author": {
+    "name": "dollarkillerx",
+    "url": "https://github.com/dollarkillerx"
+  },
+  "homepage": "https://github.com/dollarkillerx/claude-chrome",
+  "repository": "https://github.com/dollarkillerx/claude-chrome",
+  "keywords": ["chrome", "browser", "automation", "mcp"]
+}

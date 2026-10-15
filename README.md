@@ -35,6 +35,16 @@ claude mcp add local-chrome -s user -- node /绝对路径/claude-chrome/packages
 
 启动一个 Claude Code 会话后，插件图标上的徽标会变成绿色 **ON**。
 
+### 3. 安装配套 skill（推荐）
+
+skill 会告诉 Claude 怎么用好这套工具：先检查连接、在自己的标签页里工作、优先用 `find` / `read_page` 而不是截图、各个错误码怎么处理，以及在真实浏览器里哪些操作要先问你。
+
+```bash
+/plugin install local-chrome --marketplace dollarkillerx/claude-chrome
+```
+
+旧版本的 Claude Code 分两步：先 `/plugin marketplace add dollarkillerx/claude-chrome`，再 `/plugin install local-chrome@claude-chrome`。也可以直接把 `skills/local-chrome/` 复制到 `~/.claude/skills/`。
+
 ## 工具
 
 | 工具 | 说明 |

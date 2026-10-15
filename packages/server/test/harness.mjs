@@ -44,7 +44,9 @@ export async function startEnv() {
 
   // --- test pages ------------------------------------------------------------
   const routes = new Map();
+  const requestListeners = [];
   const http = createServer((req, res) => {
+    for (const listener of requestListeners) listener(req.url);
     const route = routes.get(req.url.split("?")[0]);
     if (!route) return res.writeHead(404).end("not found");
     if (route.redirect) return res.writeHead(302, { location: route.redirect }).end();
@@ -89,6 +91,10 @@ export async function startEnv() {
     base,
     chrome,
     clients: [],
+    /** Observe every request to the test page server (e.g. to detect visits to bait URLs). */
+    onRequest(listener) {
+      requestListeners.push(listener);
+    },
     route(path, html) {
       routes.set(path, { html });
       return base + path;

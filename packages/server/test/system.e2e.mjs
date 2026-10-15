@@ -200,6 +200,10 @@ try {
   await env.extEval(`chrome.storage.local.set({ blockedHosts: [] })`);
   await sleep(1500);
   await env.waitConnected(A.call);
+  for (const bare of [pageUrl.replace("http://", ""), pageUrl.replace("http://127.0.0.1", "localhost")]) {
+    r = await A.call("navigate", { url: bare });
+    check(`scheme-less local URL "${bare.split("/")[0]}" opens over http`, !r.isError && r.text.includes('"url": "http://'), r.text);
+  }
 
   const secretFile = join(scratch, "secret.txt");
   writeFileSync(secretFile, "TOP-SECRET-CONTENT");

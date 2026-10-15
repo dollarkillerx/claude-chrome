@@ -56,9 +56,15 @@ export async function isAllowed(url: string | undefined): Promise<boolean> {
   );
 }
 
-/** Adds https:// when the URL has no scheme. */
+const SCHEMELESS_URL_PROTOCOLS = /^(about|data|blob|javascript|view-source|mailto|chrome|devtools|file):/i;
+const LOCAL_HOST = /^(localhost|127(\.\d+){3}|\[::1\]|0\.0\.0\.0)(:\d+)?([/?#]|$)/i;
+
+/**
+ * Adds a scheme when missing: http:// for local dev hosts ("localhost:3000" must not be read as a
+ * "localhost:" scheme), https:// for everything else.
+ */
 export function normalizeUrl(input: string): string {
   const trimmed = input.trim();
-  if (/^[a-z][a-z0-9+.-]*:/i.test(trimmed)) return trimmed;
-  return "https://" + trimmed;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) || SCHEMELESS_URL_PROTOCOLS.test(trimmed)) return trimmed;
+  return (LOCAL_HOST.test(trimmed) ? "http://" : "https://") + trimmed;
 }
